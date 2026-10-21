@@ -1,0 +1,2163 @@
+import base64, colorsys, html, io, ipaddress, json, os, re, socket, time
+from concurrent.futures import ThreadPoolExecutor
+from functools import lru_cache
+from urllib.parse import urljoin, urlparse
+from urllib.request import Request, urlopen
+import requests
+from bs4 import BeautifulSoup
+from PIL import Image, ImageColor, ImageDraw, ImageFilter, ImageFont, ImageOps
+import streamlit as st
+import streamlit.components.v1 as components
+
+st.set_page_config(page_title='trustedDialog Preview Builder',
+                   page_icon='https://img.ui-portal.de/trusteddialog/trustlogo/trusted-sign_GMX.svg', layout='wide')
+
+SEAL_URL = 'https://img.ui-portal.de/trusteddialog/trustlogo/trusted-sign_GMX.svg'
+GMX_LOGO_URL = 'https://logo.ui-portal.de/td/ab166bef-b456-4e67-984f-72fb64d4a2c6/bo10.svg'
+UA = 'Mozilla/5.0 (compatible; trustedDialog-Preview-Builder/1.0)'
+PREVIEW_SIZE = (1088, 464)
+AVATAR_DEFAULT = '#B8DDFD'     # Fallback-Avatar (Initialen) laut GMX-Vorlage
+AVATAR_BG_DEFAULT = '#FFFFFF'  # Hintergrund hinter Logo-Avataren der tD-Mail (transparente SVG/PNG)
+# Promo-Code unter der tD-Preview-Grafik (Mockup 3). Maximale Zeichenanzahl jeweils inkl. Leerzeichen.
+PROMO_LABEL_MAX = 17           # Codebeschreibung (der Doppelpunkt wird automatisch ergänzt)
+PROMO_CODE_MAX = 25            # Code
+PROMO_LABEL_DEFAULT, PROMO_CODE_DEFAULT = 'Codebeschreibung', 'IhrCode'
+# Website-Abruf: Zeitlimits (Sekunden)
+FETCH_CONNECT_TIMEOUT = 8      # Verbindungsaufbau
+FETCH_READ_TIMEOUT = 15       # Warten auf Antwort je Versuch
+PAGE_FETCH_BUDGET = 15         # Gesamtzeit für alle Versuche beim Abruf der Startseite (max. 15 s)
+IMAGE_FETCH_BUDGET = 10        # Gesamtzeit je Bild / Logo / Manifest (werden parallel geladen)
+# Website-Motive
+MOTIF_LIMIT = 8                # so viele Motive stehen maximal zur Auswahl
+# Optional: Bildbeschreibungen per KI (nur aktiv, wenn ANTHROPIC_API_KEY als Streamlit-Secret oder Umgebungsvariable gesetzt ist)
+ANTHROPIC_URL = 'https://api.anthropic.com/v1/messages'
+ANTHROPIC_MODEL_DEFAULT = 'claude-haiku-5-5'    # per Secret/Umgebungsvariable ANTHROPIC_MODEL überschreibbar
+
+
+@st.cache_data(show_spinner=False)
+def remote_data_uri(url):
+    try:
+        req = Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urlopen(req, timeout=8) as response:
+            data = response.read()
+            content_type = response.headers.get_content_type() or 'image/svg+xml'
+        return f'data:{content_type};base64,' + base64.b64encode(data).decode()
+    except Exception:
+        return url
+
+
+def uri(f):
+    if not f:
+        return ''
+    mime = 'image/svg+xml' if f.name.lower().endswith('.svg') else (f.type or 'image/png')
+    return f'data:{mime};base64,' + base64.b64encode(f.getvalue()).decode()
+
+
+def e(x):
+    return html.escape(x or '', quote=True)
+
+
+def display_text(x):
+    """Nur escapen; das Kürzen mit „…“ übernimmt der Browser pixelgenau (Siegel und Uhrzeit bleiben sichtbar)."""
+    return e(re.sub(r'\s+', ' ', x or '').strip()[:80])
+
+
+# ---------------------------------------------------------------------------
+# Website-Analyse
+# ---------------------------------------------------------------------------
+def normalize_domain(value):
+    value = (value or '').strip()
+    if value and not value.startswith(('http://', 'https://')):
+        value = 'https://' + value
+    return value
+
+
+def public_url(value):
+    try:
+        parsed = urlparse(value)
+        if parsed.scheme not in ('http', 'https') or not parsed.hostname:
+            return False
+        for answer in socket.getaddrinfo(parsed.hostname, parsed.port or 443, type=socket.SOCK_STREAM):
+            ip = ipaddress.ip_address(answer[4][0])
+            if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast:
+                return False
+        return True
+    except Exception:
+        return False
+
+
+# Header-Sätze in dieser Reihenfolge: erst schlicht, dann „vollwertiger Browser“. Hintergrund: Bot-Schutz-Systeme (z. B. Akamai
+# bei zalando.de) gleichen den behaupteten Browser (User-Agent, Sec-Fetch-*) mit dem TLS-Fingerabdruck der Verbindung ab. Ein
+# Python-Client, der sich als Chrome ausgibt, fällt dabei oft eher auf als ein schlichter Client. Umgekehrt verlangen andere
+# Seiten (z. B. hm.com) gerade vollständige Browser-Header. Deshalb werden alle Varianten nacheinander probiert.
+BROWSER_HEADERS = [
+    {'User-Agent': 'Mozilla/5.0', 'Accept-Language': 'de-DE,de;q=0.9,en;q=0.8'},
+    {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+     'Accept-Language': 'de-DE,de;q=0.9,en;q=0.8', 'Accept-Encoding': 'gzip, deflate',
+     'Upgrade-Insecure-Requests': '1', 'Sec-Fetch-Dest': 'document', 'Sec-Fetch-Mode': 'navigate',
+     'Sec-Fetch-Site': 'none', 'Sec-Fetch-User': '?1'},
+    {'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15',
+     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+     'Accept-Language': 'de-DE,de;q=0.9', 'Accept-Encoding': 'gzip, deflate'},
+    {'User-Agent': 'Mozilla/5.0 (compatible; trustedDialogPreviewBuilder/1.0)', 'Accept': 'text/html,*/*;q=0.8',
+     'Accept-Language': 'de-DE,de;q=0.9,en;q=0.8'},
+]
+BOT_BLOCK_STATUS = {401, 403, 406, 418, 429, 451, 503, 999}      # typische Antworten eines Bot-Schutzes
+
+
+def alternate_urls(value):
+    """Dieselbe Seite mit bzw. ohne „www.“ – manche Server antworten nur unter einer der beiden Schreibweisen
+    (oder der eine Host ist deutlich langsamer als der andere)."""
+    try:
+        parts = urlparse(value)
+        host = parts.hostname or ''
+        labels = host.split('.')
+        if host.startswith('www.'):
+            alt = host[4:]
+        elif len(labels) == 2 or (len(labels) == 3 and labels[-2] in SECOND_LEVEL):
+            alt = 'www.' + host
+        else:
+            return []
+        netloc = alt + (f':{parts.port}' if parts.port else '')
+        return [parts._replace(netloc=netloc).geturl()]
+    except Exception:
+        return []
+
+
+def friendly_fetch_error(error):
+    """Verständliche Fehlermeldung statt „HTTPSConnectionPool(host=…): Read timed out“."""
+    if isinstance(error, requests.Timeout):
+        return str(error) if not str(error).startswith(('HTTPSConnectionPool', 'HTTPConnectionPool')) else \
+            'Zeitüberschreitung: Die Website hat nicht rechtzeitig geantwortet'
+    if isinstance(error, requests.exceptions.SSLError):
+        return 'SSL-/Zertifikatsfehler beim Verbindungsaufbau'
+    if isinstance(error, requests.ConnectionError):
+        return 'Verbindung zur Website nicht möglich (Server nicht erreichbar oder Verbindung abgebrochen)'
+    return str(error)
+
+
+def safe_fetch(value, max_bytes=7000000, truncate=False, budget=IMAGE_FETCH_BUDGET, alternates=False):
+    """Lädt eine URL. truncate=True: bei Überschreitung von max_bytes wird abgeschnitten statt abgebrochen
+    (für HTML sinnvoll: Meta-Tags, Logos und Farben stehen fast immer am Anfang der Seite). Kommt eine HTML-Seite nur
+    teilweise an (Verbindung bricht ab / Timeout mitten im Download), wird der bereits geladene Anfang verwendet.
+    Wird eine Variante abgelehnt (HTTP-Fehler, Bot-Schutz, Timeout), wird die nächste Header-Variante probiert.
+    alternates=True: bei Misserfolg zusätzlich die Schreibweise mit/ohne „www.“.
+    budget: Gesamtzeit in Sekunden für alle Versuche zusammen."""
+    if not public_url(value):
+        raise ValueError('Die Domain ist nicht öffentlich erreichbar oder wurde aus Sicherheitsgründen blockiert.')
+    urls = [value] + [u for u in (alternate_urls(value) if alternates else []) if public_url(u)]
+    started = time.monotonic()
+    deadline = started + budget
+    last_error, last_status, timed_out = None, None, False
+    for headers, url in [(h, u) for h in BROWSER_HEADERS for u in urls]:     # je Header-Variante erst alle Hosts
+        remaining = deadline - time.monotonic()
+        if remaining < 3:
+            break
+        timeout = (min(FETCH_CONNECT_TIMEOUT, remaining), min(FETCH_READ_TIMEOUT, remaining))
+        try:
+            with requests.get(url, headers=headers, timeout=timeout, stream=True, allow_redirects=True) as response:
+                if response.status_code >= 400:
+                    last_status = response.status_code
+                    last_error = requests.HTTPError(f'HTTP {response.status_code}')
+                    continue                                          # nächste Variante
+                if not public_url(response.url):
+                    raise ValueError('Die Weiterleitung wurde blockiert.')
+                content_type = response.headers.get('content-type', '')
+                data = bytearray()
+                try:
+                    for chunk in response.iter_content(65536):
+                        data.extend(chunk)
+                        if len(data) > max_bytes:
+                            if truncate:
+                                del data[max_bytes:]
+                                break
+                            raise ValueError('Die abgerufene Datei ist zu groß.')
+                except requests.RequestException:
+                    if truncate and len(data) >= 30000:               # Anfang der Seite genügt für die Analyse
+                        return bytes(data), response.url, content_type
+                    raise
+                return bytes(data), response.url, content_type
+        except requests.Timeout as error:
+            timed_out, last_error = True, error
+        except requests.RequestException as error:
+            last_error = error
+    if last_status in BOT_BLOCK_STATUS:
+        raise requests.HTTPError(f'{last_status} – die Website blockiert automatische Abrufe (Bot-Schutz)')
+    if last_status:
+        raise requests.HTTPError(f'HTTP-Fehler {last_status} beim Abruf der Website')
+    if timed_out:
+        raise requests.Timeout(f'Zeitüberschreitung: Die Website hat auch nach {int(time.monotonic() - started)} Sekunden '
+                               'nicht (vollständig) geantwortet')
+    raise last_error or ValueError('Die Website konnte nicht geladen werden.')
+
+
+def meta(soup, *keys):
+    for key in keys:
+        node = soup.find('meta', attrs={'property': key}) or soup.find('meta', attrs={'name': key})
+        if node and node.get('content'):
+            return node['content'].strip()
+    return ''
+
+
+def unique(values):
+    out = []
+    seen = set()
+    for value in values:
+        if value and value not in seen:
+            seen.add(value)
+            out.append(value)
+    return out
+
+
+def short(value, limit=37):
+    value = re.sub(r'\s+', ' ', value or '').strip()
+    return value if len(value) <= limit else value[:limit - 3].rstrip() + '...'
+
+
+# ---------------------------------------------------------------------------
+# Markenname des Absenders
+# ---------------------------------------------------------------------------
+LEGAL_SUFFIX_RE = re.compile(
+    r'(?:,?\s+)(?:GmbH\s*&\s*Co\.?\s*(?:KGaA|KG|OHG)|GmbH|gGmbH|AG|SE|KGaA|KG|OHG|UG(?:\s*\(haftungsbeschränkt\))?|'
+    r'e\.\s?K\.?|e\.\s?V\.?|Inc\.?|Ltd\.?|LLC|S\.A\.?|B\.V\.?|N\.V\.?|S\.r\.l\.?|Corp\.?|Co\.)\s*$', re.I)
+SHOP_SUFFIX_RE = re.compile(
+    r'(?:\s*[-–|:]\s*|\s+)(?:offizielle[rs]?\s+)?(?:online[- ]?shop|onlineshop|shop online|webshop|online[- ]?store|'
+    r'official (?:online )?(?:store|site|website)|offizielle (?:website|seite|homepage))\s*$', re.I)
+GENERIC_NAMES = {'home', 'startseite', 'homepage', 'start', 'shop', 'onlineshop', 'online shop', 'willkommen', 'welcome',
+                 'index', 'website', 'offizielle website', 'official website', 'mode', 'news', 'login', 'anmelden'}
+TITLE_SPLIT_RE = re.compile(r'\s+[|–—·•»:]\s+|\s+-\s+|\s*\|\s*')
+SECOND_LEVEL = {'co', 'com', 'org', 'net', 'ac', 'gv', 'or', 'ne', 'gov', 'edu'}
+
+
+def brand_key(value):
+    value = (value or '').lower()
+    for a, b in (('ä', 'ae'), ('ö', 'oe'), ('ü', 'ue'), ('ß', 'ss'), ('&', 'und')):
+        value = value.replace(a, b)
+    return re.sub(r'[^a-z0-9]', '', value)
+
+
+def domain_label(host):
+    parts = [p for p in (host or '').lower().split('.') if p and p != 'www']
+    if len(parts) >= 3 and parts[-2] in SECOND_LEVEL:
+        return parts[-3]
+    return parts[-2] if len(parts) >= 2 else (parts[0] if parts else '')
+
+
+def clean_brand(value):
+    value = re.sub(r'\s+', ' ', html.unescape(value or '')).strip(' -|–—·•:»«"\'®™©')
+    value = re.sub(r'^(?:©|\(c\)|copyright)\s*(?:\d{4}(?:\s*[-–]\s*\d{4})?)?\s*', '', value, flags=re.I)
+    for _ in range(2):
+        value = SHOP_SUFFIX_RE.sub('', value).strip(' -|–—·,')
+        value = LEGAL_SUFFIX_RE.sub('', value).strip(' -|–—·,')
+    if ' ' not in value:                                   # „dm.de“ / „home24.de“ -> Markenname ohne Endung
+        value = re.sub(r'(?i)^(?:www\.)?([\w-]+)\.(?:de|com|at|ch|net|org|eu|shop|info|biz|io|co\.uk|nl|fr|it)$', r'\1', value)
+    return value.strip(' ®™')
+
+
+def json_ld_names(soup):
+    """Liefert (Name, Gewicht) aus JSON-LD: Organization/Brand/Store > WebSite > publisher."""
+    out = []
+
+    def walk(node, depth=0):
+        if depth > 6:
+            return
+        if isinstance(node, list):
+            for item in node:
+                walk(item, depth + 1)
+            return
+        if not isinstance(node, dict):
+            return
+        kind = node.get('@type', '')
+        kind = ' '.join(kind) if isinstance(kind, list) else str(kind)
+        name = node.get('name') if isinstance(node.get('name'), str) else ''
+        if name:
+            if re.search(r'Organization|Corporation|Brand|Store|LocalBusiness|NewsMediaOrganization', kind):
+                out.append((name, 6))
+            elif 'WebSite' in kind:
+                out.append((name, 4))
+        for key in ('publisher', 'brand', 'author', '@graph', 'mainEntity'):
+            if key in node:
+                walk(node[key], depth + 1)
+
+    for tag in soup.find_all('script', attrs={'type': 'application/ld+json'})[:12]:
+        try:
+            walk(json.loads(tag.string or tag.get_text() or ''))
+        except Exception:
+            continue
+    return out
+
+
+def detect_brand(soup, host):
+    """Markenname des Absenders. Quellen werden gewichtet und gegen die Domain geprüft,
+    damit nicht ein Seitentitel wie „Mode online kaufen“ als Absender landet."""
+    label = domain_label(host)
+    label_key = brand_key(label)
+    candidates = []
+
+    def add(value, weight):
+        value = clean_brand(value)
+        if 2 <= len(value) <= 40 and value.lower() not in GENERIC_NAMES:
+            candidates.append((value, weight))
+
+    add(meta(soup, 'og:site_name'), 6)
+    add(meta(soup, 'application-name'), 5)
+    add(meta(soup, 'apple-mobile-web-app-title'), 5)
+    for name, weight in json_ld_names(soup):
+        add(name, weight)
+    title = soup.title.get_text(' ', strip=True) if soup.title else ''
+    for source, weight in ((title, 3), (meta(soup, 'og:title'), 2)):
+        parts = [p for p in TITLE_SPLIT_RE.split(source or '') if p.strip()]
+        for index, part in enumerate(parts):
+            add(part, weight + (1 if index in (0, len(parts) - 1) and len(parts) > 1 else 0))
+    for tag in soup.find_all('img')[:80]:
+        marker = (' '.join(tag.get('class', [])) + ' ' + (tag.get('id') or '') + ' ' + (tag.get('src') or '')).lower()
+        if 'logo' in marker:
+            add(re.sub(r'(?i)\s*(?:-\s*)?logo\b.*$', '', tag.get('alt') or tag.get('title') or ''), 3)
+    twitter = meta(soup, 'twitter:site').lstrip('@')
+    if twitter:
+        add(twitter, 1)
+    copyright_match = re.search(r'(?:©|&copy;|Copyright)\s*(?:\d{4}(?:\s*[-–]\s*\d{4})?)?\s*([A-ZÄÖÜ][\w&.\- ]{1,40}?)'
+                                r'(?:\s*(?:GmbH|AG|SE|KG|Inc|Ltd)\b|[.,|]|\s{2}|$)', soup.get_text(' ', strip=True)[-6000:])
+    if copyright_match:
+        add(copyright_match.group(1), 2)
+
+    best, best_score = '', -99.0
+    for value, weight in candidates:
+        key = brand_key(value)
+        if not key:
+            continue
+        score = weight
+        if label_key and key == label_key:
+            score += 10
+        elif label_key and len(label_key) >= 2 and (key.startswith(label_key) or label_key.startswith(key)):
+            score += 7
+        elif label_key and len(label_key) >= 3 and (label_key in key or key in label_key):
+            score += 5
+        elif not label_key or weight < 5:
+            score -= 4                      # Titel-Fragment ohne Bezug zur Domain -> eher Slogan als Marke
+        words = len(value.split())
+        score -= max(0, words - 3) * 1.5 + len(value) * .04
+        if value.isupper() and len(value) > 4 and words == 1 and label_key and key == label_key:
+            score += .5                     # Schreibweise der Marke (z. B. „OTTO“) beibehalten
+        if score > best_score:
+            best, best_score = value, score
+    if best and best_score >= 3:
+        return best
+    return label.replace('-', ' ').title() if label else host
+
+
+# ---------------------------------------------------------------------------
+# Farben: Kontrast und Marken-/CI-Farberkennung
+# ---------------------------------------------------------------------------
+HEX_RE = re.compile(r'#([0-9a-fA-F]{6}|[0-9a-fA-F]{3})(?![0-9a-zA-Z])')
+RGB_RE = re.compile(r'rgba?\(\s*(\d{1,3})\s*[, ]\s*(\d{1,3})\s*[, ]\s*(\d{1,3})')
+CSS_VAR_RE = re.compile(
+    r'--[\w-]*(?:primary|brand|accent|cta|highlight|key|main)[\w-]*\s*:\s*(#[0-9a-fA-F]{3,6}\b|rgba?\([^)]+\))', re.I)
+
+
+def rgb_to_hex(rgb):
+    return '#%02x%02x%02x' % tuple(int(max(0, min(255, v))) for v in rgb[:3])
+
+
+def parse_color(raw):
+    """CSS-Farbe (#abc, #aabbcc, rgb(...)) -> (r, g, b) oder None."""
+    raw = (raw or '').strip()
+    m = HEX_RE.fullmatch(raw)
+    if m:
+        h = m.group(1)
+        if len(h) == 3:
+            h = ''.join(c * 2 for c in h)
+        return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+    m = RGB_RE.match(raw)
+    if m:
+        return tuple(min(255, int(v)) for v in m.groups())
+    return None
+
+
+def safe_brand_rgb(value):
+    try:
+        rgb = ImageColor.getrgb(value)
+        return tuple(rgb[:3])
+    except Exception:
+        return (19, 117, 215)
+
+
+def rel_lum(rgb):
+    def channel(v):
+        v /= 255
+        return v / 12.92 if v <= .03928 else ((v + .055) / 1.055) ** 2.4
+    r, g, b = [channel(v) for v in rgb[:3]]
+    return .2126 * r + .7152 * g + .0722 * b
+
+
+def contrast(a, b):
+    la, lb = rel_lum(a), rel_lum(b)
+    return (max(la, lb) + .05) / (min(la, lb) + .05)
+
+
+def hsv(rgb):
+    return colorsys.rgb_to_hsv(*[v / 255 for v in rgb[:3]])
+
+
+def usable_brand_color(rgb):
+    """Graue, fast weiße und fast schwarze Töne sind keine Markenfarben."""
+    _, s, v = hsv(rgb)
+    return s >= .28 and v >= .18 and .015 <= rel_lum(rgb) <= .85
+
+
+def page_color_scores(soup, html_text):
+    """Sammelt Farbkandidaten der Seite: theme-color, CSS-Variablen, Häufigkeit im Quelltext."""
+    scores = {}
+
+    def add(raw, weight):
+        rgb = parse_color(raw)
+        if rgb and usable_brand_color(rgb):
+            key = rgb_to_hex(rgb)
+            scores[key] = scores.get(key, 0) + weight
+
+    add(meta(soup, 'theme-color', 'msapplication-TileColor'), 9)
+    for match in CSS_VAR_RE.findall(html_text[:500000]):
+        add(match, 5)
+    counts = {}
+    source = html_text[:500000]
+    for match in HEX_RE.finditer(source):
+        counts[match.group(0)] = counts.get(match.group(0), 0) + 1
+    for match in RGB_RE.finditer(source):
+        key = 'rgb(%s,%s,%s)' % match.groups()
+        counts[key] = counts.get(key, 0) + 1
+    for raw, count in counts.items():
+        add(raw, count ** .7)
+    return scores
+
+
+def dominant_logo_color(logo):
+    """Häufigste gesättigte Farbe eines Logos (beste Quelle für die CI-Farbe)."""
+    if logo is None:
+        return None
+    small = logo.convert('RGBA')
+    small.thumbnail((96, 96))
+    buckets = {}
+    for r, g, b, a in small.getdata():
+        if a < 200:
+            continue
+        _, s, v = colorsys.rgb_to_hsv(r / 255, g / 255, b / 255)
+        if s < .3 or v < .2:
+            continue
+        key = (r // 24, g // 24, b // 24)
+        n, sr, sg, sb = buckets.get(key, (0, 0, 0, 0))
+        buckets[key] = (n + 1, sr + r, sg + g, sb + b)
+    if not buckets:
+        return None
+    n, sr, sg, sb = max(buckets.values(), key=lambda item: item[0])
+    return (sr // n, sg // n, sb // n)
+
+
+def rank_brand_colors(scores, logo=None):
+    scores = dict(scores)
+    logo_rgb = dominant_logo_color(logo)
+    if logo_rgb and usable_brand_color(logo_rgb):
+        key = rgb_to_hex(logo_rgb)
+        scores[key] = scores.get(key, 0) + 30
+    ranked = []
+    for key, score in sorted(scores.items(), key=lambda item: item[1] * (.5 + hsv(parse_color(item[0]))[1]), reverse=True):
+        rgb = parse_color(key)
+        for index, (leader, total) in enumerate(ranked):
+            lead = parse_color(leader)
+            if sum((a - b) ** 2 for a, b in zip(rgb, lead)) ** .5 < 38:
+                ranked[index] = (leader, total + score)  # ähnliche Töne zusammenfassen
+                break
+        else:
+            ranked.append((key, score))
+    ranked.sort(key=lambda item: item[1], reverse=True)
+    return [key for key, _ in ranked][:8]
+
+
+PROMO_KEYWORDS = [  # (Suchwort, Bezeichnung in der Box)
+    (r'gutschein-?code', 'Ihr Gutscheincode'), (r'rabatt-?code', 'Ihr Rabattcode'), (r'promo-?code', 'Ihr Promo-Code'),
+    (r'aktions-?code', 'Ihr Aktionscode'), (r'vorteils-?code', 'Ihr Vorteilscode'), (r'coupon-?code|coupon', 'Ihr Coupon-Code'),
+    (r'voucher-?code|discount code|promo code', 'Ihr Code'), (r'code', 'Ihr Code')]
+PROMO_STOPWORDS = {'JETZT', 'HIER', 'NEU', 'GRATIS', 'CODE', 'ONLINE', 'SHOP', 'EUR', 'EINLÖSEN', 'EINLOESEN', 'GILT',
+                   'NUR', 'BEI', 'MIT', 'UND', 'FÜR', 'DEN', 'DER', 'DIE', 'DAS', 'AGB', 'FAQ', 'PDF', 'HTML', 'UTF'}
+
+
+def find_promo_codes(text):
+    """Sucht Gutschein-/Rabatt-/Promo-Codes im Seitentext („mit dem Code SALE20“, „Gutscheincode: HERBST15“ …).
+    Rückgabe: Liste von {'label', 'code'} – sinnvollste Treffer zuerst."""
+    found = []
+    for keyword, label in PROMO_KEYWORDS:
+        pattern = (r'(?i:' + keyword + r')\b\s*(?:lautet|ist|:|–|-)?\s*[„"»\'“]?\s*'
+                   r'([A-Z0-9][A-Z0-9_-]{2,24})(?![A-Za-z0-9])')
+        for match in re.finditer(pattern, text):
+            code = match.group(1).strip('-_')
+            if code in PROMO_STOPWORDS or len(code) < 3 or not re.search(r'[A-Z]', code):
+                continue
+            if code.isdigit() or re.fullmatch(r'\d+[A-Z]?', code):
+                continue
+            if not re.search(r'\d', code) and len(code) < 4:
+                continue
+            found.append({'label': label, 'code': code})
+    out, seen = [], set()
+    for item in found:
+        if item['code'] not in seen:
+            seen.add(item['code'])
+            out.append(item)
+    out.sort(key=lambda item: (len(item['code']) > PROMO_CODE_MAX, item['label'] == 'Ihr Code'))
+    return out[:6]
+
+
+OFFER_PATTERNS = [r'\b\d{1,2}\s?%\s*(?:Rabatt|sparen|off)?\b',
+                  r'\b\d+(?:[,.]\d{1,2})?\s?€\s*(?:Rabatt|Gutschein|sparen)?\b',
+                  r'\b(?:Willkommensrabatt|Gratis Versand|kostenloser Versand|Sale|Gutschein|Rabatt)\b[^.!?]{0,65}']
+GENERIC_ALT_RE = re.compile(r'^(?:image|img|bild|foto|photo|banner|teaser|hero|stage|slide|picture|grafik|platzhalter|'
+                            r'placeholder|logo|kachel|\d+)$', re.I)
+
+
+def find_offers(text):
+    out = []
+    for pattern in OFFER_PATTERNS:
+        out.extend(re.findall(pattern, text or '', flags=re.I))
+    return unique([re.sub(r'\s+', ' ', x).strip(' -|') for x in out])
+
+
+def clean_text(value, limit=90):
+    return re.sub(r'\s+', ' ', html.unescape(value or '')).strip(' -–—|·•:')[:limit].rstrip()
+
+
+def informative(value):
+    """Alt-Text/Überschrift nur übernehmen, wenn er wirklich beschreibt (kein Dateiname, keine ID, kein „Bild“)."""
+    text = clean_text(value, 120)
+    if not 3 <= len(text) <= 100 or GENERIC_ALT_RE.match(text):
+        return ''
+    if re.search(r'\.(?:jpe?g|png|webp|avif|gif|svg)\b', text, re.I):
+        return ''
+    if sum(ch.isalpha() for ch in text) < len(text) * .5:
+        return ''
+    if ' ' not in text and re.search(r'[_\d]{4,}', text):
+        return ''
+    return text
+
+
+def img_source(tag):
+    """Bild-URL eines <img>: Lazy-Load-Attribute zuerst (src ist dort oft nur ein Platzhalter), dann srcset (größte Variante)."""
+    for attr in ('data-src', 'data-lazy-src', 'data-original', 'src'):
+        value = (tag.get(attr) or '').strip()
+        if value and not value.startswith('data:'):
+            return value
+    for attr in ('srcset', 'data-srcset'):
+        best, best_width = '', -1
+        for part in (tag.get(attr) or '').split(','):
+            bits = part.strip().split()
+            if not bits or bits[0].startswith('data:'):
+                continue
+            width = 0
+            if len(bits) > 1 and bits[1].lower().endswith('w') and bits[1][:-1].isdigit():
+                width = int(bits[1][:-1])
+            if width > best_width:
+                best, best_width = bits[0], width
+        if best:
+            return best
+    return ''
+
+
+def image_context(tag):
+    """Beschreibende Texte zu einem Website-Bild: Alt-Text, Link-Beschriftung, Bildunterschrift sowie Überschrift,
+    Teaser-Text und Angebote im selben Teaser-Block. Daraus entstehen sprechende Namen und passende Texte zum Motiv."""
+    info = {'label': '', 'caption': '', 'heading': '', 'teaser': '', 'offers': [], 'has_context': False}
+    if tag is None:
+        return info
+    link = tag.find_parent('a')
+    candidates = [tag.get('alt'), tag.get('title'), link.get('aria-label') if link else '', link.get('title') if link else '']
+    info['label'] = next((t for t in map(informative, candidates) if t), '')
+    figure = tag.find_parent('figure')
+    caption = figure.find('figcaption') if figure else None
+    info['caption'] = informative(caption.get_text(' ', strip=True)) if caption else ''
+    node, container, raw = tag, None, ''
+    for _ in range(6):
+        node = node.parent
+        if node is None or getattr(node, 'name', None) in (None, 'body', 'html', '[document]', 'header', 'nav', 'footer', 'main'):
+            break
+        text = node.get_text(' ', strip=True)
+        if len(text) > 500:
+            break                                    # zu großer Block: mehrere Teaser gemischt
+        if len(text) >= 12:
+            container, raw = node, text
+            break
+    if container is not None:
+        head = container.find(['h1', 'h2', 'h3', 'h4', 'h5', 'h6']) or container.find(class_=re.compile(r'head|title|claim', re.I))
+        info['heading'] = informative(head.get_text(' ', strip=True)) if head else ''
+        info['teaser'] = clean_text(raw, 140)
+        info['offers'] = find_offers(raw)[:3]
+        info['has_context'] = True
+    return info
+
+
+def analyze_site(value, pasted=None):
+    """pasted=None: Website wird abgerufen. pasted='...': eingefügter Seitentext/Quelltext wird statt des Abrufs
+    analysiert (Workaround bei Bot-Schutz). pasted='' liefert nur ein leeres Grundgerüst (Marke aus der Domain)."""
+    if pasted is None:
+        raw, final_url, content_type = safe_fetch(normalize_domain(value), 3000000, truncate=True,
+                                                  budget=PAGE_FETCH_BUDGET, alternates=True)
+    else:
+        raw, final_url = pasted.encode('utf-8'), normalize_domain(value)
+    html_text = raw.decode('utf-8', errors='ignore')
+    soup = BeautifulSoup(raw, 'html.parser')
+    host = (urlparse(final_url).hostname or '').replace('www.', '')
+    brand = detect_brand(soup, host)
+    description = meta(soup, 'og:description', 'description')
+    body_text = ' '.join(soup.stripped_strings)
+    offers = find_offers(body_text)[:8]
+    promos = find_promo_codes(body_text[:400000])
+    color_scores = page_color_scores(soup, html_text)
+    images = []
+    logos = []
+    og = meta(soup, 'og:image', 'twitter:image')
+    og_src = urljoin(final_url, og) if og else ''
+    if og_src:
+        images.append((6, og_src, None))
+    for tag in soup.find_all('img'):
+        src = img_source(tag)
+        if not src:
+            continue
+        src = urljoin(final_url, src)
+        marker = (' '.join(tag.get('class', [])) + ' ' + (tag.get('id') or '') + ' ' + (tag.get('alt') or '')).lower()
+        if 'logo' in marker:
+            logos.append(src)
+        elif not src.lower().split('?')[0].endswith(('.svg', '.gif')):
+            score = 0
+            if any(word in marker for word in ('hero', 'banner', 'stage', 'campaign', 'teaser')):
+                score += 5
+            try:
+                width = int(str(tag.get('width', '0')).replace('px', ''))
+                height = int(str(tag.get('height', '0')).replace('px', ''))
+                if width >= 600:
+                    score += 3
+                if width and height and width / height > 1.5:
+                    score += 2
+            except Exception:
+                pass
+            images.append((score, src, tag))
+    for link in soup.find_all('link'):
+        rel = ' '.join(link.get('rel', [])).lower()
+        if any(x in rel for x in ('icon', 'apple-touch-icon')) and link.get('href'):
+            logos.append(urljoin(final_url, link['href']))
+    image_tags, ordered = {}, []
+    for score, src, tag in sorted(images, key=lambda item: item[0], reverse=True):
+        if src not in image_tags:
+            image_tags[src] = tag
+            ordered.append(src)
+    images = ordered[:12]                              # Reserve: einige Bilder fallen später als unbrauchbar/doppelt weg
+    image_info = {src: image_context(image_tags[src]) for src in images}
+    if og_src in image_info and image_tags.get(og_src) is None:        # og:image gehört zur Seite insgesamt
+        og_title = meta(soup, 'og:title')
+        image_info[og_src].update({'label': informative(meta(soup, 'og:image:alt', 'twitter:image:alt')),
+                                   'teaser': clean_text(og_title, 140),
+                                   'offers': find_offers(og_title + ' ' + meta(soup, 'og:description'))[:3]})
+    logos = unique(logos)[:8]
+    avatar_sources = collect_avatar_sources(soup, final_url)
+    offer = offers[0] if offers else ''
+    if offer:
+        subject = short(('Jetzt ' + offer + ' sichern') if len(offer) < 26 else offer)
+        preheader = short('Angebot jetzt entdecken')
+    else:
+        subject = short('Neuigkeiten von ' + brand)
+        preheader = short('Jetzt Vorteile entdecken')
+    return {'url': final_url, 'brand': short(brand), 'description': description, 'offers': offers,
+            'color_scores': color_scores, 'colors': rank_brand_colors(color_scores), 'images': images,
+            'image_info': image_info,
+            'logos': logos, 'avatar_sources': avatar_sources, 'subject': subject, 'preheader': preheader,
+            'promos': promos}
+
+
+# ---------------------------------------------------------------------------
+# Avatar-Kandidaten (Icons und Logos der Website)
+# ---------------------------------------------------------------------------
+def icon_size_hint(value):
+    sizes = [int(a) * int(b) for a, b in re.findall(r'(\d+)\s*x\s*(\d+)', value or '', re.I)]
+    return int(max(sizes) ** .5) if sizes else 0
+
+
+SVG_CASE = ['viewBox', 'preserveAspectRatio', 'gradientUnits', 'gradientTransform', 'patternUnits', 'patternTransform',
+            'clipPathUnits', 'maskUnits', 'maskContentUnits', 'stdDeviation', 'textLength', 'lengthAdjust', 'baseProfile',
+            'clipPath', 'linearGradient', 'radialGradient', 'feGaussianBlur', 'feOffset', 'feFlood', 'feComposite',
+            'feMerge', 'feMergeNode', 'feColorMatrix', 'feBlend', 'textPath', 'foreignObject', 'xlink:href']
+
+
+def fix_svg_case(markup):
+    """Der HTML-Parser schreibt Inline-SVG klein (viewbox, lineargradient) – SVG braucht die Originalschreibweise."""
+    for name in SVG_CASE:
+        markup = re.sub(r'(?<=[\s<"/])' + name.lower() + r'(?=[\s=>/])', name, markup)
+    if 'xmlns=' not in markup[:300]:
+        markup = markup.replace('<svg', '<svg xmlns="http://www.w3.org/2000/svg"', 1)
+    return markup
+
+
+def collect_avatar_sources(soup, base_url):
+    """Sammelt Avatar-Kandidaten mit Priorität. Rückgabe: Liste von (Priorität, Quelle, Bezeichnung);
+    Quelle ist eine URL oder ein Inline-SVG (beginnt mit '<svg')."""
+    found = []
+    manifest = ''
+    for link in soup.find_all('link', href=True):
+        rel = ' '.join(link.get('rel', [])).lower()
+        href = urljoin(base_url, link['href'])
+        size = icon_size_hint(link.get('sizes'))
+        if 'apple-touch-icon' in rel:
+            found.append((10 + min(size, 512) / 256, href, f'App-Icon{f" {size}px" if size else ""}'))
+        elif 'mask-icon' in rel:
+            found.append((2, href, 'Masken-Icon (SVG)'))
+        elif 'icon' in rel:
+            svg = 'svg' in (link.get('type') or '') or href.lower().split('?')[0].endswith('.svg')
+            found.append((7 + (2 if svg else 0) + min(size, 256) / 128, href, 'Favicon (SVG)' if svg else
+                          f'Favicon{f" {size}px" if size else ""}'))
+        elif 'manifest' in rel and not manifest:
+            manifest = href
+    tile = meta(soup, 'msapplication-TileImage')
+    if tile:
+        found.append((6, urljoin(base_url, tile), 'Kachel-Icon'))
+    for tag in soup.find_all('script', attrs={'type': 'application/ld+json'})[:12]:
+        for logo in re.findall(r'"logo"\s*:\s*(?:\{[^}]*?"url"\s*:\s*)?"([^"]+)"', tag.string or tag.get_text() or ''):
+            found.append((8.5, urljoin(base_url, logo), 'Logo (strukturierte Daten)'))
+    for tag in soup.find_all('img'):
+        src = tag.get('src') or tag.get('data-src') or tag.get('data-lazy-src')
+        marker = (' '.join(tag.get('class', [])) + ' ' + (tag.get('id') or '') + ' ' + (tag.get('alt') or '') + ' '
+                  + (src or '')).lower()
+        if src and 'logo' in marker and not src.startswith('data:image/gif'):
+            found.append((5, urljoin(base_url, src), 'Logo-Grafik der Seite'))
+    for svg in soup.find_all('svg')[:60]:
+        parents = [p for p in svg.parents if getattr(p, 'name', None) in ('a', 'div', 'span', 'header')][:3]
+        marker = (' '.join(svg.get('class', [])) + ' ' + (svg.get('id') or '') + ' ' + (svg.get('aria-label') or '') +
+                  ' ' + ' '.join(' '.join(p.get('class', [])) + ' ' + (p.get('id') or '') for p in parents)).lower()
+        if 'logo' in marker and len(str(svg)) < 150000 and not svg.find('use'):
+            found.append((4, fix_svg_case(str(svg)), 'Logo (Inline-SVG)'))
+    if manifest:
+        try:
+            raw, final, _ = safe_fetch(manifest, 300000)
+            for icon in json.loads(raw.decode('utf-8', errors='ignore')).get('icons', [])[:8]:
+                if icon.get('src'):
+                    size = icon_size_hint(icon.get('sizes'))
+                    found.append((9 + min(size, 512) / 256, urljoin(final, icon['src']),
+                                  f'Web-App-Icon{f" {size}px" if size else ""}'))
+        except Exception:
+            pass
+    found.append((1, urljoin(base_url, '/favicon.ico'), 'Favicon (Standard)'))
+    found.sort(key=lambda item: item[0], reverse=True)
+    out, seen = [], set()
+    for priority, source, label in found:
+        if source not in seen:
+            seen.add(source)
+            out.append((priority, source, label))
+    return out[:16]
+
+
+# ---------------------------------------------------------------------------
+# Bild-Helfer
+# ---------------------------------------------------------------------------
+def flatten_to_rgb(image):
+    """Transparente PNGs auf Weiß legen (statt schwarzem Hintergrund)."""
+    if image.mode in ('RGBA', 'LA') or (image.mode == 'P' and 'transparency' in image.info):
+        rgba = image.convert('RGBA')
+        base = Image.new('RGBA', rgba.size, (255, 255, 255, 255))
+        base.alpha_composite(rgba)
+        return base.convert('RGB')
+    return image.convert('RGB')
+
+
+def image_from_bytes(raw):
+    image = Image.open(io.BytesIO(raw))
+    image.load()
+    return image
+
+
+def image_from_url(value):
+    raw, _, _ = safe_fetch(value, 9000000)
+    return flatten_to_rgb(image_from_bytes(raw))
+
+
+def to_bytes(image, fmt='PNG'):
+    buffer = io.BytesIO()
+    if fmt == 'JPEG':
+        image.convert('RGB').save(buffer, 'JPEG', quality=93)
+    else:
+        image.save(buffer, 'PNG', optimize=False)
+    return buffer.getvalue()
+
+
+def png_data(image):
+    return to_bytes(image, 'PNG')
+
+
+def is_svg_bytes(raw):
+    head = raw[:2048].lstrip().lower()
+    return head.startswith(b'<svg') or (head.startswith(b'<?xml') and b'<svg' in raw[:4096].lower()) or \
+        (head.startswith(b'<!--') and b'<svg' in raw[:4096].lower())
+
+
+def sized_svg(raw):
+    """SVG ohne width/height erhält Maße aus der viewBox – sonst zeichnet der Browser es nicht zuverlässig in ein Canvas."""
+    text = raw.decode('utf-8', errors='ignore')
+    match = re.search(r'<svg\b[^>]*>', text, re.I)
+    if not match:
+        return raw
+    tag = match.group(0)
+    if 'xmlns=' not in tag:
+        tag = tag[:-1].rstrip('/') + ' xmlns="http://www.w3.org/2000/svg">' if not tag.endswith('/>') else tag
+    width = re.search(r'\swidth\s*=\s*["\']\s*([\d.]+)(px)?\s*["\']', tag)
+    height = re.search(r'\sheight\s*=\s*["\']\s*([\d.]+)(px)?\s*["\']', tag)
+    view = re.search(r'viewBox\s*=\s*["\']\s*[-\d.]+[\s,]+[-\d.]+[\s,]+([\d.]+)[\s,]+([\d.]+)', tag, re.I)
+    if not (width and height):
+        w, h = (float(view.group(1)), float(view.group(2))) if view else (256.0, 256.0)
+        tag = re.sub(r'\s(width|height)\s*=\s*["\'][^"\']*["\']', '', tag)
+        tag = tag.replace('<svg', f'<svg width="{w:g}" height="{h:g}"', 1)
+    return (text[:match.start()] + tag + text[match.end():]).encode('utf-8')
+
+
+def avatar_data_uri(raw):
+    """Bilddaten -> Data-URI für den Avatar. SVG bleibt Vektor (mit Maßen), alles andere wird PNG (max. 256 px).
+    Rückgabe (data_uri, Breite, Höhe) oder None, wenn es kein brauchbares Bild ist."""
+    if not raw:
+        return None
+    if is_svg_bytes(raw):
+        data = sized_svg(raw)
+        if b'<script' in data.lower():
+            return None
+        return 'data:image/svg+xml;base64,' + base64.b64encode(data).decode(), 0, 0
+    try:
+        image = Image.open(io.BytesIO(raw))
+        if getattr(image, 'format', '') == 'ICO':
+            sizes = sorted(image.info.get('sizes', []) or [image.size])
+            image.size = sizes[-1]
+        image.load()
+    except Exception:
+        return None
+    image = image.convert('RGBA')
+    if min(image.size) < 16:
+        return None
+    width, height = image.size
+    image.thumbnail((256, 256), Image.Resampling.LANCZOS)
+    return 'data:image/png;base64,' + base64.b64encode(png_data(image)).decode(), width, height
+
+
+AVATAR_DARK_BG = '#1F1F1F'      # Hintergrund für helle/weiße Logos, die auf Weiß nicht lesbar wären
+AVATAR_IDEAL_PX = 132          # Avatar: 33 px Anzeige x 4 (PNG-Export 3-fach + Reserve) -> kleinste Größe ab hier ist ideal
+NAMED_COLORS = {'white': (255, 255, 255), 'black': (0, 0, 0), 'red': (255, 0, 0), 'blue': (0, 0, 255),
+                'green': (0, 128, 0), 'yellow': (255, 255, 0), 'orange': (255, 165, 0), 'gray': (128, 128, 128),
+                'grey': (128, 128, 128), 'silver': (192, 192, 192), 'navy': (0, 0, 128)}
+
+
+def initials_text_color(background):
+    """Initialen immer gut lesbar: Weiß nur bei ausreichendem Kontrast (WCAG 4,5:1), sonst dunkles Blau bzw. Schwarz."""
+    bg = safe_brand_rgb(background)
+    for candidate in ('#FFFFFF', '#0B3C6E', '#000000'):
+        if contrast(ImageColor.getrgb(candidate), bg) >= 4.5:
+            return candidate
+    return '#000000'
+
+
+LOGO_MIN_CONTRAST = 2.5        # Mindestkontrast Logo/Hintergrund (klassisches Orange auf Weiß bleibt auf Weiß)
+
+
+def readable_on(pixels, background, threshold=LOGO_MIN_CONTRAST):
+    """Anteil der sichtbaren Logo-Pixel, die sich ausreichend vom Hintergrund abheben."""
+    if not pixels:
+        return 1.0
+    return sum(1 for p in pixels if contrast(p, background) >= threshold) / len(pixels)
+
+
+def logo_backdrop(image):
+    """Wählt den Avatar-Hintergrund für eine Rastergrafik: Weiß (Standard) – außer das Logo ist hell/weiß und
+    wäre auf Weiß nicht lesbar; dann dunkler Hintergrund. Vollflächige Icons (eigener Hintergrund) bleiben auf Weiß."""
+    rgba = image.convert('RGBA')
+    rgba.thumbnail((64, 64))
+    data = list(rgba.getdata())
+    visible = [p[:3] for p in data if p[3] > 160]
+    if not visible or len(visible) / len(data) > .92:          # deckendes Icon: Hintergrund spielt keine Rolle
+        return AVATAR_BG_DEFAULT
+    white, dark = (255, 255, 255), ImageColor.getrgb(AVATAR_DARK_BG)
+    if readable_on(visible, white) >= .3 or readable_on(visible, white) >= readable_on(visible, dark):
+        return AVATAR_BG_DEFAULT
+    return AVATAR_DARK_BG
+
+
+def svg_backdrop(raw):
+    """Wie logo_backdrop, für SVG (ohne Rendern): wertet die im SVG verwendeten Farben aus.
+    Ohne Farbangabe zeichnet SVG schwarz -> Weiß passt."""
+    text = raw.decode('utf-8', errors='ignore').lower()
+    colors = []
+    for value in re.findall(r'(?:fill|stroke|stop-color|color)\s*[:=]\s*["\']?\s*(#[0-9a-f]{3,6}\b|rgba?\([^)]*\)|[a-z]+)', text):
+        rgb = parse_color(value) or NAMED_COLORS.get(value)
+        if rgb:
+            colors.append(rgb)
+    if not colors:
+        return AVATAR_BG_DEFAULT
+    white, dark = (255, 255, 255), ImageColor.getrgb(AVATAR_DARK_BG)
+    if readable_on(colors, white) >= .3 or readable_on(colors, white) >= readable_on(colors, dark):
+        return AVATAR_BG_DEFAULT
+    return AVATAR_DARK_BG
+
+
+def avatar_info(raw):
+    """Bilddaten -> {'src', 'thumb', 'w', 'h', 'bg', 'sig'} oder None. sig = optischer Fingerabdruck (Dubletten)."""
+    result = avatar_data_uri(raw)
+    if not result:
+        return None
+    src, width, height = result
+    if not width:                                                  # SVG
+        return {'src': src, 'thumb': src, 'w': 0, 'h': 0, 'bg': svg_backdrop(sized_svg(raw)), 'sig': None}
+    image = image_from_bytes(base64.b64decode(src.split(',', 1)[1])).convert('RGBA')
+    flat = Image.new('RGBA', image.size, (255, 255, 255, 255))
+    flat.alpha_composite(image)
+    flat = flat.convert('RGB')
+    ink = ImageOps.invert(flat.convert('L')).point(lambda v: 255 if v > 24 else 0).getbbox()   # bedruckter Bereich
+    core = flat.crop(ink) if ink else flat
+    sig = list(core.resize((16, 16), Image.Resampling.BOX).getdata())
+    small = image.copy()
+    small.thumbnail((96, 96), Image.Resampling.LANCZOS)
+    thumb = 'data:image/png;base64,' + base64.b64encode(png_data(small)).decode()
+    return {'src': src, 'thumb': thumb, 'w': width, 'h': height, 'bg': logo_backdrop(image), 'sig': sig,
+            'ratio': width / height}
+
+
+def same_avatar(a, b):
+    """Optisch gleiche Grafik (nur andere Pixelgröße)?"""
+    if a['sig'] is None or b['sig'] is None:
+        return a['src'] == b['src']
+    if abs(a['ratio'] - b['ratio']) > .12:
+        return False
+    diff = sum(abs(x - y) for p, q in zip(a['sig'], b['sig']) for x, y in zip(p, q)) / (16 * 16 * 3)
+    tiny = min(a['w'], a['h'], b['w'], b['h']) < 48          # Mini-Favicons sind unscharf -> großzügiger vergleichen
+    return diff < (40 if tiny else 22)
+
+
+def ideal_rank(option):
+    """Kleinere Zahl = bessere Auflösung: kleinste Variante ab AVATAR_IDEAL_PX, sonst die größte."""
+    side = min(option['w'], option['h'])
+    return (0, side) if side >= AVATAR_IDEAL_PX else (1, -side)
+
+
+def fetch_avatar_source(source):
+    try:
+        raw = source.encode('utf-8') if source.lstrip().startswith('<svg') else \
+            safe_fetch(source, 2500000, budget=IMAGE_FETCH_BUDGET)[0]
+        return avatar_info(raw)
+    except Exception:
+        return None
+
+
+def load_avatar_options(sources, limit=8):
+    """Lädt die Avatar-Kandidaten parallel und zeigt jede Grafik nur EINMAL: gleiche Grafik in mehreren Pixelgrößen
+    (z. B. Favicon 32/96/192 px + App-Icon 180 px) wird zu einem Vorschlag in der idealen Auflösung zusammengefasst."""
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        infos = list(pool.map(fetch_avatar_source, [source for _, source, _ in sources]))
+    groups = []                                                    # je optisch gleicher Grafik eine Gruppe
+    for (priority, source, label), info in zip(sources, infos):
+        if not info:
+            continue
+        info.update({'label': label, 'priority': priority, 'url': '' if source.lstrip().startswith('<svg') else source})
+        group = next((g for g in groups if same_avatar(g[0], info)), None)
+        if group is None:
+            groups.append([info])
+        else:
+            group.append(info)
+    options = []
+    for group in groups:
+        rasters = [o for o in group if o['w']]
+        best = min(rasters, key=ideal_rank) if rasters else group[0]
+        side = min(best['w'], best['h'])
+        score = max(o['priority'] for o in group) + (2 if side >= 120 else -3 if 0 < side < 48 else 0)
+        if best['w'] and best['h'] and not .6 <= best['w'] / best['h'] <= 1.6:
+            score -= 2                                    # breite Logos passen schlechter in den runden Avatar
+        options.append({'src': best['src'], 'thumb': best['thumb'], 'bg': best['bg'], 'label': best['label'],
+                        'detail': f"{best['w']}×{best['h']}px" if best['w'] else 'SVG', 'score': score,
+                        'hidden': len(group) - 1, 'url': best['url']})
+    options.sort(key=lambda item: item['score'], reverse=True)
+    return options[:limit]
+
+
+def usable_motif(image):
+    width, height = image.size
+    return width >= 500 and height >= 220 and .7 <= width / height <= 4
+
+
+def prepare_logo(image):
+    """Logo zuschneiden; weißen Hintergrund (JPG/PNG ohne Alpha) freistellen."""
+    logo = image.convert('RGBA')
+    w, h = logo.size
+    px = logo.load()
+    corners = [px[0, 0], px[w - 1, 0], px[0, h - 1], px[w - 1, h - 1]]
+    if all(c[3] > 240 and min(c[:3]) > 240 for c in corners):
+        logo.putdata([(r, g, b, 0) if min(r, g, b) > 238 else (r, g, b, a) for r, g, b, a in logo.getdata()])
+    bbox = logo.getchannel('A').point(lambda v: 255 if v > 20 else 0).getbbox()
+    if bbox:
+        logo = logo.crop(bbox)
+    return logo if min(logo.size) >= 40 else None
+
+
+def smart_fit(image, size):
+    """Zuschnitt mit Fokus auf kontrastreiche, farbige Bildbereiche statt starrer Bildmitte."""
+    small = image.convert('RGB')
+    small.thumbnail((96, 96))
+    edges = small.convert('L').filter(ImageFilter.FIND_EDGES).filter(ImageFilter.GaussianBlur(1.5))
+    sat = small.convert('HSV').getchannel('S')
+    w, h = small.size
+    total = sx = sy = 0.0
+    for y in range(h):
+        for x in range(w):
+            weight = edges.getpixel((x, y)) + .5 * sat.getpixel((x, y)) + 1
+            total += weight
+            sx += weight * x
+            sy += weight * y
+    cx, cy = (sx / total / w, sy / total / h) if total else (.5, .5)
+    centering = (min(.75, max(.25, cx)), min(.75, max(.25, cy)))
+    return ImageOps.fit(image.convert('RGB'), size, Image.Resampling.LANCZOS, centering=centering)
+
+
+# ---------------------------------------------------------------------------
+# Schriften (robuste Suche, skalierbarer Fallback)
+# ---------------------------------------------------------------------------
+BOLD_PREFERENCE = ['roboto-black.ttf', 'roboto-bold.ttf', 'inter-extrabold.ttf', 'inter-bold.ttf',
+                   'montserrat-extrabold.ttf', 'montserrat-bold.ttf', 'opensans-bold.ttf', 'notosans-bold.ttf',
+                   'liberationsans-bold.ttf', 'arialbd.ttf', 'arial bold.ttf', 'helveticaneue-bold.ttf',
+                   'dejavusans-bold.ttf']
+
+
+@lru_cache(maxsize=1)
+def font_index():
+    here = os.path.dirname(os.path.abspath(__file__)) if '__file__' in globals() else os.getcwd()
+    roots = [os.path.join(here, 'fonts'), '/usr/share/fonts', '/usr/local/share/fonts', os.path.expanduser('~/.fonts'),
+             os.path.expanduser('~/.local/share/fonts'), '/Library/Fonts', '/System/Library/Fonts/Supplemental',
+             'C:/Windows/Fonts']
+    found = {}
+    for root in roots:
+        for directory, _, files in os.walk(root):
+            for name in files:
+                if name.lower().endswith(('.ttf', '.otf')):
+                    found.setdefault(name.lower(), os.path.join(directory, name))
+    return found
+
+
+@lru_cache(maxsize=64)
+def get_font(size):
+    size = max(8, int(size))
+    index = font_index()
+    for name in BOLD_PREFERENCE:
+        if name in index:
+            try:
+                return ImageFont.truetype(index[name], size)
+            except OSError:
+                continue
+    try:
+        return ImageFont.load_default(size)  # Pillow >= 10.1: skalierbar
+    except TypeError:
+        return ImageFont.load_default()
+
+
+def cap_height(font):
+    return -font.getbbox('H', anchor='ls')[1]
+
+
+# ---------------------------------------------------------------------------
+# tD-Preview-Grafik
+# ---------------------------------------------------------------------------
+def campaign_message(headline):
+    """Reduziert Website-Wording auf EINE dominante Botschaft + kurzen CTA (ohne Erfindungen)."""
+    text = re.sub(r'\s+', ' ', headline or '').strip()
+    low = text.lower()
+    urgent = next((w for w in ('Nur heute', 'Letzte Chance', 'Endet morgen') if w.lower() in low), '')
+    percent = re.search(r'(?<![\d,.])(\d{1,2})\s?(?:%|prozent)', text, re.I)
+    euro = re.search(r'(?<![\d,.])(\d+(?:[,.]\d{1,2})?)\s?€', text)
+    if percent:
+        upper = 'BIS ZU' if 'bis zu' in low else (urgent.upper() if urgent else '')
+        return {'upper': upper, 'main': percent.group(1) + ' %', 'lower': 'RABATT' if 'rabatt' in low else 'SICHERN',
+                'cta': 'JETZT SHOPPEN', 'numeric': True}
+    if re.search(r'(gratis|kostenlos\w*) versand', low):
+        return {'upper': '', 'main': 'GRATIS', 'lower': 'VERSAND', 'cta': 'JETZT SHOPPEN', 'numeric': True}
+    if euro:
+        upper = 'AB' if re.search(r'\bab\b', low) else (urgent.upper() if urgent else '')
+        lower = 'GUTSCHEIN' if 'gutschein' in low else ('RABATT' if 'rabatt' in low else '')
+        return {'upper': upper, 'main': euro.group(1) + ' €', 'lower': lower, 'cta': 'ANGEBOT SICHERN', 'numeric': True}
+    if re.search(r'\bsale\b', low):
+        return {'upper': '', 'main': 'SALE', 'lower': '', 'cta': 'JETZT SPAREN', 'numeric': True}
+    if not text or low.startswith('neuigkeiten von'):
+        return {'upper': '', 'main': 'NEU ENTDECKEN', 'lower': '', 'cta': 'JETZT ENTDECKEN', 'numeric': False}
+    cleaned = re.sub(r'\bjetzt\b', '', text, flags=re.I)
+    cleaned = re.sub(r'\s+', ' ', cleaned).strip(' -–—!.')
+    words = cleaned.split()[:3]
+    return {'upper': '', 'main': ' '.join(words).upper() or 'NEU ENTDECKEN', 'lower': '', 'cta': 'JETZT ENTDECKEN',
+            'numeric': False}
+
+
+def panel_colors(brand):
+    """Wählt Textfarbe nach WCAG-Kontrast; dunkelt die Markenfarbe nur im Notfall ab."""
+    white, ink = (255, 255, 255), (17, 17, 17)
+    if contrast(brand, white) >= 3.5:      # sehr große, fette Schrift: 3:1 reicht formal, 3,5:1 wirkt klein noch lesbar
+        return brand, white
+    if contrast(brand, ink) >= 4.5:
+        return brand, ink
+    adjusted = brand
+    for _ in range(30):
+        adjusted = tuple(int(v * .93) for v in adjusted)
+        if contrast(adjusted, white) >= 3.8:
+            break
+    return adjusted, white
+
+
+def wrap_words(words, font, max_width):
+    lines, line = [], ''
+    for word in words:
+        if font.getlength(word) > max_width:
+            return None
+        test = (line + ' ' + word).strip()
+        if font.getlength(test) <= max_width:
+            line = test
+        else:
+            lines.append(line)
+            line = word
+    if line:
+        lines.append(line)
+    return lines
+
+
+def fit_message(msg, box_w, box_h, S):
+    """Skaliert Text so, dass er Breite UND Höhe des Textfeldes einhält. Rückgabe: (Zeilen, Zeilenabstand)."""
+    if msg['numeric']:
+        for size in range(190 * S, 60 * S - 1, -4 * S):
+            items, ok = [], True
+            for key, ratio, minimum in (('upper', .22, 30), ('main', 1, 0), ('lower', .30, 34)):
+                text = msg[key]
+                if not text:
+                    continue
+                font = get_font(size if key == 'main' else max(int(size * ratio), minimum * S))
+                if font.getlength(text) > box_w:
+                    ok = False
+                    break
+                items.append((text, font, cap_height(font)))
+            if not ok:
+                continue
+            gap = int(size * .13)
+            if sum(i[2] for i in items) + gap * (len(items) - 1) <= box_h:
+                return items, gap
+        font = get_font(60 * S)
+        return [(msg['main'], font, cap_height(font))], 0
+    words = msg['main'].split()
+    for size in range(150 * S, 34 * S - 1, -2 * S):
+        font = get_font(size)
+        lines = wrap_words(words, font, box_w)
+        if lines is None or len(lines) > 3:
+            continue
+        cap, gap = cap_height(font), int(size * .26)
+        if len(lines) * cap + (len(lines) - 1) * gap <= box_h:
+            return [(line, font, cap) for line in lines], gap
+    font = get_font(34 * S)
+    return [(msg['main'], font, cap_height(font))], 0
+
+
+def draw_arrow(draw, x, cy, length, width, color):
+    r = width / 2
+    draw.line([(x, cy), (x + length, cy)], fill=color, width=int(width))
+    head = length * .42
+    draw.line([(x + length - head, cy - head), (x + length, cy), (x + length - head, cy + head)], fill=color,
+              width=int(width), joint='curve')
+    for px_, py_ in ((x, cy), (x + length, cy), (x + length - head, cy - head), (x + length - head, cy + head)):
+        draw.ellipse((px_ - r, py_ - r, px_ + r, py_ + r), fill=color)
+
+
+def generate_preview(source, headline, brand_color='#1375d7', cta='', mirror=False):
+    """trustedDialog-Preview (1088 x 464): dominante Botschaft, ein CTA, ein Motiv, KI-Kennzeichnung.
+    Bewusst OHNE Logo/Markenzeile: In der Grafik steht nur, was unter „Grafik-Einstellungen“ editierbar ist
+    (Absender und Avatar zeigt die Mail ohnehin direkt darüber)."""
+    S = 2  # Supersampling für glatte Kanten und Schrift
+    W, H = PREVIEW_SIZE
+    WS, HS = W * S, H * S
+    brand, fg = panel_colors(safe_brand_rgb(brand_color))
+    PT, PB, M, TEXT_W = 522, 458, 52, 366          # Panel oben/unten (x), Rand, Textbreite -> Textfläche ca. 40-45 %
+    TOP, BOTTOM = 40, 40
+
+    def X(x):                                         # Spiegelung
+        return WS - x * S if mirror else x * S
+
+    canvas = Image.new('RGBA', (WS, HS), (255, 255, 255, 255))
+    art_w = (W - 380) * S
+    art = smart_fit(source, (art_w, HS))
+    canvas.paste(art, (0 if mirror else WS - art_w, 0))
+    draw = ImageDraw.Draw(canvas)
+    draw.polygon([(X(0), 0), (X(PT), 0), (X(PB), HS), (X(0), HS)], fill=brand)
+    ox = (W - M - TEXT_W) * S if mirror else M * S    # linke Kante des Textblocks
+    box_w = TEXT_W * S
+
+    brand_bottom = TOP * S                           # kein Logo-/Markenbereich mehr: Botschaft beginnt oben
+
+    # 2) CTA-Button unten
+    cta_text = (cta or '').strip().upper() or headline_cta(headline)
+    btn_h = 66 * S
+    btn_top = HS - BOTTOM * S - btn_h
+    for size in range(34 * S, 20 * S - 1, -S):
+        cfont = get_font(size)
+        arrow_len = int(size * .95)
+        tw = cfont.getlength(cta_text)
+        btn_w = int(tw + arrow_len + 28 * S * 2 + 14 * S)
+        if btn_w <= box_w:
+            break
+    on_dark = fg == (255, 255, 255)
+    btn_fill = (255, 255, 255) if on_dark else (17, 17, 17)
+    btn_text = brand if on_dark and contrast(brand, (255, 255, 255)) >= 3 else ((17, 17, 17) if on_dark else (255, 255, 255))
+    draw.rounded_rectangle((ox, btn_top, ox + btn_w, btn_top + btn_h), radius=btn_h // 2, fill=btn_fill)
+    cy = btn_top + btn_h / 2
+    draw.text((ox + 28 * S, cy + cap_height(cfont) / 2), cta_text, font=cfont, fill=btn_text, anchor='ls')
+    draw_arrow(draw, ox + 28 * S + tw + 14 * S, cy, arrow_len, max(3, size * .13), btn_text)
+
+    # 3) Hauptbotschaft in der verbleibenden Zone, vertikal zentriert
+    msg = campaign_message(headline)
+    zone_top = brand_bottom
+    zone_bottom = btn_top - 22 * S
+    items, gap = fit_message(msg, box_w, zone_bottom - zone_top, S)
+    total = sum(i[2] for i in items) + gap * (len(items) - 1)
+    y = zone_top + (zone_bottom - zone_top - total) * .45
+    for text, font, cap in items:
+        y += cap
+        draw.text((ox, y), text, font=font, fill=fg, anchor='ls')
+        y += gap
+
+    # 4) KI-Kennzeichnung (klein, an der äußeren Motivecke)
+    label_font = get_font(19 * S)
+    label = 'KI-generiert'
+    lw_ = label_font.getlength(label)
+    pw, ph = int(lw_ + 24 * S), int(cap_height(label_font) + 14 * S)
+    px0 = 18 * S if mirror else WS - 18 * S - pw
+    py0 = HS - 16 * S - ph
+    overlay = Image.new('RGBA', (WS, HS), (0, 0, 0, 0))
+    od = ImageDraw.Draw(overlay)
+    od.rounded_rectangle((px0, py0, px0 + pw, py0 + ph), radius=ph // 2, fill=(0, 0, 0, 120))
+    od.text((px0 + 12 * S, py0 + ph / 2 + cap_height(label_font) / 2), label, font=label_font, fill=(255, 255, 255, 235),
+            anchor='ls')
+    canvas.alpha_composite(overlay)
+    return canvas.convert('RGB').resize((W, H), Image.Resampling.LANCZOS)
+
+
+def headline_cta(headline):
+    return campaign_message(headline)['cta']
+
+
+@st.cache_data(show_spinner=False, max_entries=24)
+def render_banner(source_bytes, headline, brand_color, cta, mirror):
+    source = flatten_to_rgb(image_from_bytes(source_bytes))
+    return png_data(generate_preview(source, headline, brand_color, cta, mirror))
+
+
+# ---------------------------------------------------------------------------
+# Website-Motive: sprechende Beschreibung, Dubletten, passende Texte
+# ---------------------------------------------------------------------------
+def jpeg_bytes(image, max_side=None, quality=80):
+    image = image.convert('RGB')
+    if max_side:
+        image.thumbnail((max_side, max_side), Image.Resampling.LANCZOS)
+    buffer = io.BytesIO()
+    image.save(buffer, 'JPEG', quality=quality)
+    return buffer.getvalue()
+
+
+def dhash(image):
+    """64-Bit-Differenzhash: erkennt dasselbe Motiv in anderer Größe/Kompression (Dubletten)."""
+    pixels = list(image.convert('L').resize((9, 8), Image.Resampling.LANCZOS).getdata())
+    bits = 0
+    for row in range(8):
+        for col in range(8):
+            bits = (bits << 1) | int(pixels[row * 9 + col] > pixels[row * 9 + col + 1])
+    return bits
+
+
+def same_motif(a, b, tolerance=6):
+    return bin(a ^ b).count('1') <= tolerance
+
+
+def fetch_motif(url):
+    try:
+        raw, _, _ = safe_fetch(url, 9000000, budget=IMAGE_FETCH_BUDGET)
+        return flatten_to_rgb(image_from_bytes(raw))
+    except Exception:
+        return None
+
+
+def anthropic_settings():
+    key = model = ''
+    try:
+        key, model = str(st.secrets.get('ANTHROPIC_API_KEY', '') or ''), str(st.secrets.get('ANTHROPIC_MODEL', '') or '')
+    except Exception:                                    # keine secrets.toml vorhanden
+        pass
+    return ((key or os.environ.get('ANTHROPIC_API_KEY', '')).strip(),
+            (model or os.environ.get('ANTHROPIC_MODEL', '') or ANTHROPIC_MODEL_DEFAULT).strip())
+
+
+MOTIF_PROMPT = (
+    'Oben stehen {n} Bilder von der Website der Marke „{brand}“. Beschreibe jedes Bild für eine Auswahlliste auf Deutsch in '
+    'höchstens 5 Wörtern und nur, was sichtbar ist (Beispiele: „Frau in Unterwäsche“, „Armbanduhren“, „Stadion bei Nacht“, '
+    '„Sneaker auf Betonboden“). Nenne keine Namen realer Personen. Gib außerdem an, ob im Bild selbst gut lesbarer Text, '
+    'ein Preis, eine Rabattangabe oder ein Logo eingebrannt ist (text_im_bild). Antworte ausschließlich mit einem JSON-Array '
+    'ohne Erklärung, genau ein Objekt je Bild in dieser Form: [{"bild": 1, "beschreibung": "Armbanduhren", "text_im_bild": false}]')
+
+
+def describe_motifs_ai(options, brand):
+    """Beschreibt alle Motive in EINEM Aufruf. Rückgabe: ({Index: {'beschreibung', 'text_im_bild'}}, Fehlertext)."""
+    key, model = anthropic_settings()
+    if not key or not options:
+        return {}, ''
+    content = []
+    for number, option in enumerate(options, 1):
+        teaser = option['info'].get('teaser') or ''
+        content.append({'type': 'text', 'text': f'Bild {number}' + (f' (Text daneben auf der Website: „{teaser[:100]}“)' if teaser else '') + ':'})
+        content.append({'type': 'image', 'source': {'type': 'base64', 'media_type': 'image/jpeg',
+                                                    'data': base64.b64encode(jpeg_bytes(option['image'], 640, 78)).decode()}})
+    content.append({'type': 'text', 'text': MOTIF_PROMPT.replace('{n}', str(len(options))).replace('{brand}', brand or 'Marke')})
+    try:
+        response = requests.post(ANTHROPIC_URL, timeout=60,
+                                 headers={'x-api-key': key, 'anthropic-version': '2023-06-01', 'content-type': 'application/json'},
+                                 json={'model': model, 'max_tokens': 1500, 'messages': [{'role': 'user', 'content': content}]})
+        response.raise_for_status()
+        text = ''.join(b.get('text', '') for b in response.json().get('content', []) if b.get('type') == 'text')
+        data = json.loads(text[text.find('['):text.rfind(']') + 1])
+        out = {}
+        for item in data:
+            index = int(item.get('bild', 0)) - 1
+            if 0 <= index < len(options):
+                out[index] = {'beschreibung': clean_text(str(item.get('beschreibung', '')), 60),
+                              'text_im_bild': bool(item.get('text_im_bild'))}
+        return out, ('' if out else 'leere Antwort')
+    except requests.HTTPError as error:
+        return {}, f'HTTP {error.response.status_code if error.response is not None else ""}'.strip()
+    except Exception as error:                           # Schlüssel/Netz/Format – App läuft mit Website-Texten weiter
+        return {}, type(error).__name__
+
+
+def motif_label(info, ai_text, number):
+    """Sprechender Name statt Dateiname: KI-Beschreibung > Alt-Text > Link-Text > Bildunterschrift > Überschrift > Teaser."""
+    if ai_text:
+        return ai_text
+    for key in ('label', 'caption', 'heading'):
+        if info.get(key):
+            return info[key]
+    if info.get('teaser'):
+        return short(info['teaser'], 60)
+    return f'Website-Bild {number} (ohne Beschreibung)'
+
+
+def prepare_motifs(analysis):
+    """Lädt die Motiv-Kandidaten parallel, entfernt unbrauchbare und doppelte, beschreibt sie und wählt das passendste.
+    Rückgabe: {'options': [...], 'best': Index, 'best_jpeg': Bytes, 'notice': Text}"""
+    urls = analysis.get('images', [])
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        images = list(pool.map(fetch_motif, urls))
+    loaded = [{'url': url, 'image': image, 'info': (analysis.get('image_info') or {}).get(url) or image_context(None)}
+              for url, image in zip(urls, images) if image is not None]
+    failed = len(urls) - len(loaded)
+    pool_ = [o for o in loaded if usable_motif(o['image'])] or loaded
+    kept, hashes, duplicates = [], [], 0
+    for option in pool_:                                  # inhaltlich gleiche Motive (andere Größe) nur einmal anbieten
+        option['hash'] = dhash(option['image'])
+        match = next((i for i, h in enumerate(hashes) if same_motif(h, option['hash'])), None)
+        if match is None:
+            kept.append(option)
+            hashes.append(option['hash'])
+        else:
+            duplicates += 1
+            if option['image'].width * option['image'].height > kept[match]['image'].width * kept[match]['image'].height:
+                richer = max((kept[match]['info'], option['info']),      # größere Variante behalten, Beschreibung nicht verlieren
+                             key=lambda i: sum(bool(i.get(k)) for k in ('label', 'caption', 'heading', 'offers', 'has_context')))
+                option['info'] = richer
+                kept[match] = option
+    kept = kept[:MOTIF_LIMIT]
+    ai, ai_error = describe_motifs_ai(kept, analysis.get('brand', ''))
+    entries = []
+    for index, option in enumerate(kept):
+        described = ai.get(index, {})
+        info = option['info']
+        entries.append({
+            'url': option['url'], 'label': motif_label(info, described.get('beschreibung', ''), index + 1),
+            'described_by_ai': bool(described.get('beschreibung')), 'text_in_image': bool(described.get('text_im_bild')),
+            'teaser': info.get('teaser', ''), 'heading': info.get('heading', ''), 'offers': info.get('offers', []),
+            'has_context': bool(info.get('has_context')), 'size': option['image'].size,
+            'thumb': 'data:image/jpeg;base64,' + base64.b64encode(jpeg_bytes(option['image'], 168, 78)).decode()})
+    best = next((i for i, e in enumerate(entries) if not e['text_in_image']), 0)   # Motiv ohne eingebrannten Text bevorzugen
+    key, _ = anthropic_settings()
+    if ai:
+        notice = 'Die Motive wurden per KI beschrieben.'
+    elif key:
+        notice = f'KI-Beschreibung nicht möglich ({ai_error}) – es werden die Texte der Website verwendet.'
+    else:
+        notice = ('Namen stammen aus den Texten der Website (Alt-Text, Überschrift). Für Bildbeschreibungen per KI den Schlüssel '
+                  'ANTHROPIC_API_KEY hinterlegen (siehe README).')
+    if duplicates or failed:
+        notice += f' Ausgeblendet: {duplicates} doppelte, {failed} nicht ladbare Bilder.'
+    return {'options': entries, 'best': best, 'notice': notice,
+            'best_jpeg': to_bytes(kept[best]['image'], 'JPEG') if kept else None}
+
+
+def motif_texts(option, analysis):
+    """Betreff, Preview-Text und Grafik-Headline passend zum Motiv – nur Wording der Website, nichts erfunden.
+    Quelle: Angebot im Teaser des Motivs > Überschrift am Motiv > allgemeines Angebot (nur wenn das Motiv keinen eigenen
+    Kontext hat) > neutral. Ein Angebot einer ANDEREN Kategorie wird nicht zu einem Motiv gestellt."""
+    info = option or {}
+    brand = analysis['brand']
+    if info.get('offers'):
+        offer, source = info['offers'][0], 'Teaser am Motiv'
+    elif not info.get('has_context') and analysis.get('offers'):
+        offer, source = analysis['offers'][0], 'Angebot der Website (Motiv ohne eigenen Text)'
+    else:
+        offer, source = '', ''
+    if offer:
+        return {'subject': short(('Jetzt ' + offer + ' sichern') if len(offer) < 26 else offer),
+                'preheader': short('Angebot jetzt entdecken'), 'banner_headline': offer}, source
+    if info.get('heading'):
+        return {'subject': short(info['heading']), 'preheader': short('Jetzt entdecken'),
+                'banner_headline': info['heading']}, 'Überschrift am Motiv'
+    return {'subject': short('Neuigkeiten von ' + brand), 'preheader': short('Jetzt Vorteile entdecken'),
+            'banner_headline': short('Neuigkeiten von ' + brand)}, 'neutral (am Motiv wurde kein Angebot gefunden)'
+
+
+TEXT_LABELS = {'subject': 'Betreff', 'preheader': 'Preview-Text', 'banner_headline': 'Headline in der Grafik'}
+
+
+def apply_motif_texts(option, analysis, force=False):
+    """Übernimmt die zum Motiv passenden Texte. Von Hand geänderte Felder bleiben unangetastet (außer force)."""
+    texts, source = motif_texts(option, analysis)
+    auto, kept = st.session_state.auto_texts, []
+    for key, value in texts.items():
+        current = st.session_state.get(key)
+        if force or not current or current == auto.get(key):
+            st.session_state[key] = value
+        elif current != value:
+            kept.append(TEXT_LABELS[key])
+    st.session_state.auto_texts = texts
+    st.session_state.headline_source = source
+    st.session_state.motif_hint = ('Nicht überschrieben, weil du sie angepasst hast: ' + ', '.join(kept) + '.') if kept else ''
+
+
+def css_url(data_uri):
+    return 'url("' + data_uri.replace('"', '%22') + '")'
+
+
+def render_tiles(prefix, tiles, selected, per_row, on_pick, kind):
+    """Anklickbare, nummerierte Mini-Vorschau. Jede Kachel ist ein echter Streamlit-Button (Klick = ausgewählt);
+    das Vorschaubild liegt per CSS (Klasse st-key-<key>) im Button. kind: 'motif' (Rechteck) oder 'avatar' (Kreis)."""
+    base = f'div[class*="st-key-{prefix}_"] button'
+    if kind == 'motif':
+        css = [f'{base}{{position:relative;width:100%;height:auto;min-height:0;padding:70px 5px 6px;border-radius:8px}}',
+               f'{base}::before{{content:"";position:absolute;left:5px;right:5px;top:5px;height:60px;border-radius:5px;'
+               f'background:#eee var(--thumb) center/cover no-repeat}}']
+    else:
+        css = [f'{base}{{position:relative;width:100%;height:auto;min-height:0;padding:52px 2px 4px;border-radius:10px}}',
+               f'{base}::before{{content:var(--txt,"");position:absolute;left:50%;top:6px;width:40px;height:40px;'
+               f'margin-left:-20px;border-radius:50%;box-shadow:0 0 0 1px rgba(0,0,0,.14);'
+               f'background:var(--bg,#fff) var(--thumb) center/contain no-repeat;color:var(--fg,#000);'
+               f'font:700 14px/40px "Source Sans Pro",Arial,sans-serif;text-align:center}}']
+    css.append(f'{base} p{{font-size:12px;line-height:1.25;white-space:normal;word-break:break-word}}')
+    for index, tile in enumerate(tiles):
+        props = [f'--thumb:{css_url(tile["image"]) if tile.get("image") else "none"}']
+        if kind == 'avatar':
+            props.append(f'--bg:{tile.get("bg") or AVATAR_BG_DEFAULT}')
+            if tile.get('text'):
+                props += [f'--txt:"{tile["text"][:3]}"', f'--fg:{initials_text_color(tile.get("bg") or AVATAR_DEFAULT)}']
+        if index == selected:
+            props += ['border:2px solid #1375d7!important', 'background-color:#eef5fd!important']
+        css.append(f'.st-key-{prefix}_{index} button{{{";".join(props)}}}')
+    st.markdown('<style>' + '\n'.join(css) + '</style>', unsafe_allow_html=True)
+    for start in range(0, len(tiles), per_row):
+        columns = st.columns(per_row, gap='small')
+        for offset, tile in enumerate(tiles[start:start + per_row]):
+            index = start + offset
+            with columns[offset]:
+                st.button(tile['caption'], key=f'{prefix}_{index}', help=tile.get('help'), on_click=on_pick,
+                          args=(index,), use_container_width=True)
+
+
+def pick_avatar(index):
+    """Klick auf eine Avatar-Kachel. Die letzte Kachel („Initialen“) steht für -1."""
+    st.session_state.avatar_choice = -1 if index >= len(st.session_state.avatar_options) else index
+
+
+def pick_motif(index):
+    """Klick auf eine Motiv-Kachel: Bild sofort übernehmen und Texte passend zum Motiv mitführen."""
+    motif = st.session_state.motif_options[index]
+    st.session_state.motif_error = ''
+    if motif['url'] == st.session_state.selected_image:
+        return
+    try:
+        image = image_from_url(motif['url'])
+    except Exception as error:
+        st.session_state.motif_error = f'Das Bild konnte nicht übernommen werden: {friendly_fetch_error(error)}'
+        return
+    st.session_state.selected_image = motif['url']
+    st.session_state.source_image = to_bytes(image, 'JPEG')
+    apply_motif_texts(motif, st.session_state.analysis)
+
+
+# ====================================================================== UI ===
+SEAL = remote_data_uri(SEAL_URL)
+GMX_LOGO = remote_data_uri(GMX_LOGO_URL)
+
+for k, v in {'domain': '', 'sender': 'Marke', 'subject': 'Betreff', 'preheader': 'Preview-Text',
+             'analysis': None, 'generated_preview': None, 'avatar_options': [], 'avatar_choice': -1,
+             'avatar_fit': 'Eingepasst', 'avatar_pad': 0, 'selected_image': '', 'motif_error': '',
+             'source_image': None, 'brand_color': '#1375d7', 'banner_headline': '',
+             'banner_cta': '', 'banner_mirror': False, 'promo_show': False, 'promo_label': PROMO_LABEL_DEFAULT,
+             'promo_code': PROMO_CODE_DEFAULT, 'fetch_failed': False, 'fetch_error': '', 'paste_html': '',
+             'show_open_mail': False, 'motif_options': [], 'motif_notice': '', 'auto_texts': {}, 'headline_source': '', 'motif_hint': ''}.items():
+    st.session_state.setdefault(k, v)
+
+
+def apply_palette_choice():
+    choice = st.session_state.get('palette_choice')
+    if choice:
+        st.session_state.brand_color = choice
+
+
+STICKY_CSS = (
+    '<style>'
+    '[data-testid="stColumn"]:has(#td-sticky-anchor),[data-testid="column"]:has(#td-sticky-anchor)'
+    '{position:sticky;top:4rem;align-self:flex-start;z-index:5}'
+    '[data-testid="stColumn"]:has(#td-sticky-anchor) iframe,[data-testid="column"]:has(#td-sticky-anchor) iframe'
+    '{height:calc(100vh - 5rem)!important;min-height:520px}'
+    '[data-testid="stElementContainer"]:has(#td-sticky-anchor),.element-container:has(#td-sticky-anchor){display:none}'
+    '[data-testid="stMainBlockContainer"],.block-container{padding-top:4.25rem!important}'
+    '</style><div id="td-sticky-anchor"></div>')
+
+
+left, right = st.columns([1, 2], gap='large')   # links bearbeiten, rechts die sticky Vorschau
+with left:
+    st.title('trustedDialog Preview Builder')
+    st.caption('Domain eingeben, Vorschläge automatisch erstellen und anschließend direkt bearbeiten.')
+
+    st.checkbox('4. Mockup einblenden: geöffnete E-Mail (Dummy)', key='show_open_mail',
+                help='Zeigt zusätzlich zu den 3 Mockups eine geöffnete E-Mail mit Marke, Avatar, Siegel, Uhrzeit und Betreff. '
+                     'Die Mockups 1–3 bleiben unverändert; der Export enthält dann alle 4 Mockups.')
+
+    st.subheader('1. Unternehmen analysieren')
+    with st.form('domain_form', border=False):    # Formular: Enter im Eingabefeld = Klick auf „Vorschläge erstellen“
+        d1, d2 = st.columns([3, 2], vertical_alignment='bottom')   # Eingabefeld schmaler, damit „Vorschläge erstellen“ auf dem Desktop komplett lesbar bleibt
+        with d1:
+            st.text_input('Für welche Domain soll das trustedDialog Preview generiert werden?', key='domain',
+                          placeholder='z. B. www.beispiel.de')
+        with d2:
+            analyze_clicked = st.form_submit_button('Vorschläge erstellen', type='primary', use_container_width=True)
+    paste_clicked = manual_clicked = False
+    if st.session_state.fetch_failed:
+        st.warning('Die Website konnte nicht automatisch gelesen werden (' + st.session_state.fetch_error + '). '
+                   'Ein erneuter Klick auf „Vorschläge erstellen“ hilft bei langsamen Servern manchmal. Sonst geht es so weiter: '
+                   '**Quelltext** der Startseite im Browser öffnen (Strg+U bzw. Cmd+Option+U), mit Strg+A / Cmd+A alles markieren, '
+                   'kopieren und hier einfügen – dann werden auch Logos, Motive und Farben gefunden. '
+                   'Mit reinem Seitentext (Strg+A auf der Website selbst) funktionieren nur Marke, Angebote und Promo-Code; '
+                   'Grafiken lädst du dann selbst hoch.')
+        st.text_area('Quelltext oder Seitentext der Website (optional)', key='paste_html', height=150,
+                     placeholder='Quelltext (empfohlen) oder Text der Website hier einfügen …')
+        f1, f2 = st.columns(2)
+        with f1:
+            paste_clicked = st.button('Aus eingefügtem Text analysieren', use_container_width=True,
+                                      disabled=not st.session_state.paste_html.strip())
+        with f2:
+            manual_clicked = st.button('Ohne Analyse weiter', use_container_width=True,
+                                       help='Nur die Marke wird aus der Domain abgeleitet; alle Texte trägst du selbst ein.')
+    fetch_failed_now = False
+    if analyze_clicked or paste_clicked or manual_clicked:
+        pasted = st.session_state.paste_html if paste_clicked else ('' if manual_clicked else None)
+        try:
+            with st.spinner('Website wird analysiert und die Preview vorbereitet …'):
+                result = analyze_site(st.session_state.domain, pasted)
+                st.session_state.analysis = result
+                st.session_state.sender = result['brand']
+                st.session_state.subject = result['subject']
+                st.session_state.preheader = result['preheader']
+                promo = next((x for x in result.get('promos', []) if len(x['code']) <= PROMO_CODE_MAX), None)
+                st.session_state.promo_show = promo is not None       # gefundener Code wird direkt in Mockup 3 gezeigt
+                st.session_state.promo_label = promo['label'][:PROMO_LABEL_MAX] if promo else PROMO_LABEL_DEFAULT
+                st.session_state.promo_code = promo['code'] if promo else PROMO_CODE_DEFAULT
+                st.session_state.banner_headline = result['offers'][0] if result['offers'] else result['subject']
+                st.session_state.banner_cta = ''
+                st.session_state.avatar_options = load_avatar_options(result['avatar_sources'])
+                st.session_state.avatar_choice = 0 if st.session_state.avatar_options else -1
+                st.session_state.motif_error = ''
+                logo_image = None                              # Logo dient nur noch der Erkennung der Markenfarbe
+                for logo_url in result['logos']:
+                    try:
+                        raw, _, _ = safe_fetch(logo_url, 3000000)
+                        prepared = prepare_logo(image_from_bytes(raw))
+                    except Exception:
+                        continue
+                    if prepared is not None:
+                        logo_image = prepared
+                        break
+                ranked = rank_brand_colors(result['color_scores'], logo_image)
+                result['colors'] = ranked
+                st.session_state.brand_color = ranked[0] if ranked else '#1375d7'
+                st.session_state.source_image = None
+                st.session_state.selected_image = ''
+                motifs = prepare_motifs(result)               # laden, Dubletten entfernen, beschreiben, passendes Motiv wählen
+                st.session_state.motif_options = motifs['options']
+                st.session_state.motif_notice = motifs['notice']
+                best = motifs['options'][motifs['best']] if motifs['options'] else None
+                if best:
+                    st.session_state.selected_image = best['url']
+                    st.session_state.source_image = motifs['best_jpeg']
+                apply_motif_texts(best, result, force=True)   # Betreff, Preview-Text und Headline passend zum Motiv
+            st.session_state.fetch_failed = False
+            if pasted is None:
+                st.success('Vorschläge wurden erstellt. Alle Inhalte können unten überschrieben werden.')
+            elif pasted:
+                if st.session_state.motif_options:
+                    st.success('Vorschläge aus dem eingefügten Quelltext erstellt.')
+                else:
+                    st.success('Vorschläge aus dem eingefügten Text erstellt. Avatar und Preview-Bild bitte unten selbst hochladen.')
+            else:
+                st.info('Es wurde nur die Marke aus der Domain abgeleitet. Texte, Avatar und Preview-Bild bitte unten selbst eintragen bzw. hochladen.')
+        except Exception as error:
+            if pasted is None:                       # Abruf gescheitert -> Workaround anbieten statt Sackgasse
+                st.session_state.fetch_failed = True
+                st.session_state.fetch_error = friendly_fetch_error(error)
+                fetch_failed_now = True
+            else:
+                st.error(f'Die Eingabe konnte nicht analysiert werden: {error}')
+    if fetch_failed_now:
+        st.rerun()
+
+    analysis = st.session_state.analysis
+    if analysis:
+        with st.expander('Erkannte Website-Informationen', expanded=False):
+            st.write(f"**Marke:** {analysis['brand']}")
+            if analysis['offers']:
+                st.write('**Gefundene Angebots-Hinweise:** ' + ' · '.join(analysis['offers'][:5]))
+            if analysis['description']:
+                st.write('**Beschreibung:** ' + analysis['description'][:350])
+            st.caption('Bitte prüfen Sie die vorgeschlagenen Inhalte und stellen Sie sicher, dass die erforderlichen Bild- und Markenrechte vorliegen.')
+
+    # ------------------------------------------------------------------ 2. Absender & Texte der Mail
+    st.subheader('2. Absender & Texte der Mail')
+    with st.container(border=True):
+        st.text_input('Absender / Marke', key='sender', max_chars=37,
+                      help='Markenname des Absenders. Zu lange Namen werden in der Vorschau mit „…“ gekürzt, damit das Siegel sichtbar bleibt.')
+        st.text_input('Betreff', key='subject', max_chars=37)
+        st.text_input('Preview-Text', key='preheader', max_chars=37)
+
+    # ------------------------------------------------------------------ 3. Avatar
+    st.subheader('3. Avatar der trustedDialog-Mail')
+    with st.container(border=True):
+        options = st.session_state.avatar_options
+        if options:
+            st.caption('Grafik anklicken, um sie als Avatar zu verwenden.')
+            letters = ''.join(x[0] for x in (st.session_state.sender or '').split()[:2]).upper() or 'M'
+            tiles = [{'caption': str(i + 1), 'image': o.get('thumb', o['src']), 'bg': o.get('bg', AVATAR_BG_DEFAULT),
+                      'help': f"{o['label']} ({o['detail']})"} for i, o in enumerate(options)]
+            tiles.append({'caption': 'Initialen', 'image': '', 'bg': AVATAR_DEFAULT, 'text': letters,
+                          'help': 'Keine Grafik – Initialen auf der Fallback-Farbe'})
+            choice = st.session_state.avatar_choice
+            render_tiles('apick', tiles, len(options) if choice == -1 else choice, 6, pick_avatar, 'avatar')
+            if 0 <= choice < len(options):
+                o = options[choice]
+                hidden = f" · {o['hidden']} weitere Größe(n) derselben Grafik ausgeblendet" if o.get('hidden') else ''
+                st.caption(f"Gewählt: {choice + 1} · {o['label']} ({o['detail']}){hidden}")
+        else:
+            st.caption('Keine Logos gefunden – bitte unten ein eigenes Avatar / Logo hochladen.' if st.session_state.analysis
+                       else 'Nach der Website-Analyse stehen hier die gefundenen Logos und Icons zur Auswahl.')
+        af = st.file_uploader('Eigenes Avatar / Logo hochladen (überschreibt die Auswahl)',
+                              type=['svg', 'png', 'jpg', 'jpeg', 'webp'],
+                              help='SVG wird im Browser in PNG umgewandelt; transparente Bereiche erhalten automatisch einen gut lesbaren Hintergrund.')
+        st.radio('Darstellung im Kreis', ['Eingepasst', 'Füllend'], key='avatar_fit', horizontal=True,
+                 help='Eingepasst: ganzes Logo sichtbar. Füllend: Kreis wird komplett ausgefüllt (Ränder werden beschnitten).')
+        st.slider('Innenabstand (%)', 0, 30, key='avatar_pad', step=2)
+        st.caption('Farben automatisch und immer gut lesbar: Logos auf Weiß – helle/weiße Logos auf Dunkelgrau; '
+                   f'Initialen auf {AVATAR_DEFAULT} in kontrastreicher Schrift.')
+
+    # ------------------------------------------------------------------ 4. tD-Preview-Grafik (alles in einem Block)
+    st.subheader('4. trustedDialog Preview-Grafik')
+    with st.container(border=True):
+        motifs = st.session_state.motif_options
+        st.markdown('**Motiv**')
+        if motifs:
+            urls = [m['url'] for m in motifs]
+            current = urls.index(st.session_state.selected_image) if st.session_state.selected_image in urls else -1
+            st.caption('Motiv anklicken, um es direkt zu übernehmen.')
+            tiles = [{'caption': f"{i + 1} · {short(m['label'], 22)}" + (' ⚠' if m['text_in_image'] else ''),
+                      'image': m['thumb'], 'help': m['label'] + (' (enthält Text/Logo)' if m['text_in_image'] else '')}
+                     for i, m in enumerate(motifs)]
+            render_tiles('mpick', tiles, current, 3, pick_motif, 'motif')
+            if st.session_state.motif_error:
+                st.error(st.session_state.motif_error)
+            st.caption(st.session_state.motif_notice)
+            if current >= 0:
+                selected = motifs[current]
+                if selected['teaser']:
+                    st.caption(f"Text zum Motiv auf der Website: „{selected['teaser']}“")
+                if selected['text_in_image']:
+                    st.warning('Dieses Motiv enthält schon Text, Preise oder ein Logo im Bild. Die Headline der Grafik würde das '
+                               'doppeln – besser ein Motiv ohne eingebrannten Text wählen.')
+            if st.session_state.headline_source:
+                st.caption(f"Headline, Betreff und Preview-Text passen zum Motiv – Quelle: {st.session_state.headline_source}.")
+            if st.session_state.motif_hint:
+                st.info(st.session_state.motif_hint)
+        else:
+            st.caption('Nach der Website-Analyse stehen hier die gefundenen Motive zur Auswahl.')
+
+        st.markdown('**Text & Gestaltung**')
+        st.text_input('Headline in der Grafik', key='banner_headline',
+                      help='Eine einzige kurze Botschaft, z. B. „50 %“, „Sale“ oder „Neu entdecken“.')
+        st.text_input('Button-Text (CTA)', key='banner_cta', placeholder='automatisch (z. B. JETZT SHOPPEN)')
+        g1, g2 = st.columns([1, 2], vertical_alignment='bottom')
+        with g1:
+            st.color_picker('Markenfarbe', key='brand_color')
+        with g2:
+            if analysis and analysis.get('colors'):
+                st.selectbox('Erkannte Markenfarben', analysis['colors'], index=None, key='palette_choice',
+                             placeholder='Farbe aus der Website wählen', on_change=apply_palette_choice)
+        st.checkbox('Text rechts, Motiv links (gespiegelt)', key='banner_mirror')
+        pf = st.file_uploader('Eigenes Preview-Bild hochladen (ersetzt die generierte Grafik, 1088 × 464 px)',
+                              type=['png', 'jpg', 'jpeg', 'webp'])
+        if st.session_state.source_image:
+            st.session_state.generated_preview = render_banner(
+                st.session_state.source_image, st.session_state.banner_headline, st.session_state.brand_color,
+                st.session_state.banner_cta, bool(st.session_state.banner_mirror))
+        else:
+            st.session_state.generated_preview = None
+        if st.session_state.generated_preview:
+            st.download_button('Generiertes Preview-Bild herunterladen', st.session_state.generated_preview,
+                               file_name=f"trustedDialog_Preview_{re.sub(r'[^A-Za-z0-9._-]+', '_', st.session_state.sender)}_1088x464.png",
+                               mime='image/png', use_container_width=True)
+
+        st.markdown('**Promo-Code unter der Grafik**')
+        promos = (analysis or {}).get('promos', [])
+        usable = [x for x in promos if len(x['code']) <= PROMO_CODE_MAX]
+        if usable:
+            st.caption('Auf der Website gefunden: ' + ' · '.join(f"**{x['code']}**" for x in usable[:4]))
+        elif analysis:
+            st.caption('Auf der Website wurde kein Promo-Code gefunden. Bei Bedarf hier einblenden und selbst eintragen.')
+        too_long = [x['code'] for x in promos if len(x['code']) > PROMO_CODE_MAX]
+        if too_long:
+            st.caption(f'Gefunden, aber länger als {PROMO_CODE_MAX} Zeichen (nicht übernommen): ' + ', '.join(too_long[:3]))
+        st.checkbox('Promo-Code einblenden', key='promo_show',
+                    help='Blendet die gepunktete Promo-Code-Box unter der Preview-Grafik ein; die folgenden Mails rücken nach unten.')
+        c1, c2 = st.columns([1.6, 1])
+        with c1:
+            st.text_input('Codebeschreibung', key='promo_label', max_chars=PROMO_LABEL_MAX,
+                          disabled=not st.session_state.promo_show, help='Der Doppelpunkt wird automatisch ergänzt.')
+        with c2:
+            st.text_input('Code', key='promo_code', max_chars=PROMO_CODE_MAX, disabled=not st.session_state.promo_show)
+
+# ---------------------------------------------------------------------------
+# Smartphone-Mockups (344 x 701 px) – drei Geräte: 1 ohne trustedDialog, 2 mit trustedDialog, 3 mit trustedDialog Preview
+# ---------------------------------------------------------------------------
+# Maße 1:1 aus der Vorlage (344 x 701 px). Koordinaten im .screen relativ zur linken oberen Display-Ecke.
+# Grundlinien (Baseline) der Texte stammen aus der Vorlage; top = Baseline - 0,842 x Schriftgröße (Roboto, line-height 1).
+# Header (Status-Leiste, Kopfzeile, Suche) und Footer (Navigation, Home-Indikator) sind für alle drei Geräte identisch.
+PHONE_W, PHONE_GAP = 344, 36
+BOARD_H = 785                         # Vergleichsgrafik: Titel + Gerät + Rand
+BOARD_W = 1144                        # mit 3 Geräten: 3 x 344 px + 2 x 36 px Abstand + 20 px Rand
+BOARD_W_4 = BOARD_W + PHONE_W + PHONE_GAP   # mit 4. Mockup (geöffnete E-Mail): 1524 px
+TD_ROW_TOP = 134                      # Oberkante der ersten Mail (unterhalb der Trennlinie)
+TD_ROW_H_PREVIEW = 169                # Zeilenhöhe der ersten Mail mit tD-Preview-Grafik (wie bisher)
+TD_ROW_H_PLAIN = 68.5                 # Zeilenhöhe der ersten Mail ohne Preview-Grafik (gleiche Abstände wie die übrigen Mails)
+PROMO_TOP, PROMO_H, PROMO_GAP = 168, 23, 15   # Promo-Box: 13 px unter der Grafik, 23 px hoch, 15 px bis zur Trennlinie
+PROMO_EXTRA = PROMO_TOP + PROMO_H + PROMO_GAP - TD_ROW_H_PREVIEW   # = 37 px, um so viel rücken die Mails in Gerät 3 nach unten
+ROW_SHIFT = TD_ROW_H_PREVIEW - TD_ROW_H_PLAIN   # um so viel rücken die weiteren Mails bei Gerät 1 und 2 nach oben
+
+PHONE_CSS = r'''<style>
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%;overflow:hidden;background:transparent;font-family:Roboto,"Helvetica Neue",Arial,sans-serif;-webkit-font-smoothing:antialiased}
+.wrap{display:flex;flex-direction:column;align-items:center;height:100%}
+#fitbox{position:relative;flex:0 0 auto;overflow:hidden;border-radius:8px;box-shadow:0 0 0 1px rgba(128,128,128,.28)}
+#scaler{position:absolute;left:0;top:0;transform-origin:0 0}
+#board{position:relative;width:__BW__px;height:__BH__px;background:#fff;display:flex;justify-content:center;align-items:flex-start;gap:36px;padding:20px 20px 0}
+.col{display:flex;flex-direction:column;align-items:center;gap:10px}
+.ptitle{height:34px;font:400 24px/34px Roboto,"Helvetica Neue",Arial,sans-serif;color:#111;white-space:nowrap}
+.toolbar{flex:0 0 auto;display:flex;flex-wrap:wrap;gap:10px;justify-content:center;padding-top:10px}
+.phonewrap{position:relative;width:344px;height:701px}
+.sidebtn{position:absolute;border:1px solid #2c2b29;border-radius:1.5px;background:linear-gradient(90deg,#9a9895,#dcdbd9 50%,#b3b1ae)}
+.phone{position:absolute;left:7.5px;top:6.5px;width:325px;height:688px;border-radius:55px;background:#1b1a18}
+.l1,.l2,.l3,.bezel{position:absolute}
+.l1{inset:2px;border-radius:53px;background:#f1f1f1}
+.l2{inset:3px;border-radius:52px;background:#a4a4a4}
+.l3{inset:4px;border-radius:51px;background:#3f3f3f}
+.bezel{inset:5.5px;border-radius:49.5px;background:#100f0d}
+.screen{position:absolute;left:13.5px;top:12.5px;width:297.5px;height:662.5px;overflow:hidden;border-radius:42px;background:#fff;color:#111}
+.abs{position:absolute}
+.t{position:absolute;line-height:1;white-space:nowrap}
+/* Status-Leiste */
+.time{left:21.5px;top:12.2px;font:600 12px/1 Inter,-apple-system,"SF Pro Text",Roboto,Arial,sans-serif;color:#000;letter-spacing:-1px}
+.island{left:112px;top:12px;width:75px;height:22px;border-radius:11px;background:#0c0c0c}
+.island i{position:absolute;left:60.5px;top:7px;width:8px;height:8px;border-radius:50%;background:radial-gradient(circle,#0a0a2a 25%,#26357a 60%,#121212 100%)}
+.signal{left:213px;top:14px;width:18px;height:11px}
+.wifi{left:236px;top:14.5px;width:13px;height:9.5px}
+.battery{left:254px;top:15px;width:21.5px;height:10.5px;border-radius:3.5px;background:#111;color:#fff;font:700 8.4px/10.5px Inter,-apple-system,Roboto,Arial,sans-serif;text-align:center;letter-spacing:-.1px}
+.battip{left:276.3px;top:18.3px;width:1.6px;height:4px;border-radius:0 1px 1px 0;background:#c8c8c8}
+/* Kopfzeile */
+.round{width:35px;height:35px;top:45px;border-radius:50%;background:#fff;box-shadow:0 0 10px rgba(0,0,0,.065);display:flex;align-items:center;justify-content:center}
+.hicon{stroke:#111;fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+.title{left:49.5px;top:51.5px;font:700 12.5px/1 Roboto,Arial,sans-serif;color:#000}
+.mail{left:49.5px;top:64.6px;font:400 10px/1 Roboto,Arial,sans-serif;color:#a2a2a2}
+.search{left:5px;top:89px;width:284px;height:32px;border-radius:16px;background:#fdfdfd;box-shadow:0 0 10px rgba(0,0,0,.06)}
+.search .sicon{position:absolute;left:10px;top:10px;width:12px;height:12px}
+.signal svg,.wifi svg,.sicon svg,.navicon svg{display:block}
+.search span{left:30px;top:11px;font:400 13px/1 Roboto,Arial,sans-serif;color:#6e6e6e}
+.sline{left:4px;top:133px;width:286px;height:2px;background:#e8e8e8}
+/* Mailliste */
+.row{position:absolute;left:0;width:297.5px}
+.div{position:absolute;left:17.5px;right:0;bottom:0;height:1px;background:#ececec}
+.avatar{position:absolute;left:16.5px;width:33px;height:33px;border-radius:50%;object-fit:cover;display:flex;align-items:center;justify-content:center;color:#fff;font:700 12.5px/33px Roboto,Arial,sans-serif;text-align:center;background:#B8DDFD;overflow:hidden}
+.nl{position:absolute;left:59.5px;height:14px;max-width:198px;display:flex;align-items:center;white-space:nowrap}
+.sender{font:700 14px/14px Roboto,Arial,sans-serif;color:#000;min-width:0;flex:0 1 auto;overflow:hidden;white-space:nowrap}
+.seal{width:13px;height:13px;flex:0 0 13px;margin-left:4.5px;object-fit:contain}
+.sj,.pr{position:absolute;left:59.5px;width:204px;height:12.3px;font:400 12.3px/12.3px Roboto,Arial,sans-serif;white-space:nowrap;overflow:hidden}
+.sj{color:#151515}
+.sj.unread{font-weight:700;color:#000}
+.pr{color:#a0a0a0}
+.tm{position:absolute;right:9.5px;font:400 9.8px/1 Roboto,Arial,sans-serif;color:#a3a3a3}
+.pwrap{position:absolute;left:57px;top:64px;width:216px;height:91px;border-radius:3px;overflow:hidden}
+.preview{width:100%;height:100%;object-fit:cover;display:block}
+.placeholder{background:#e1002d;color:#fff;display:flex;align-items:center;justify-content:center;font-size:11px}
+/* Promo-Code-Box unter der Preview-Grafik: gepunktete Umrandung passt sich der Textlänge an */
+.promo{position:absolute;left:57px;top:168px;height:23px;max-width:216px;display:inline-flex;align-items:center;padding:0 10px;border:1.6px dotted #45872F;border-radius:11.5px;white-space:nowrap;font:400 10.6px/1 Roboto,Arial,sans-serif;color:#2A68AE}
+.promo b{font-weight:700;color:#262626;margin-right:2.7px}
+/* Navigation */
+.dock{left:0;top:581px;width:297.5px;height:77px;background:linear-gradient(to bottom,rgba(255,255,255,0) 0,#f4f4f4 17px,#efefef 100%)}
+.nav{left:8.5px;top:598px;width:277px;height:48px;border-radius:24px;background:#fff;box-shadow:0 1px 6px rgba(0,0,0,.05)}
+.navhl{left:11.5px;top:601px;width:57.5px;height:43px;border-radius:21.5px;background:#eeeeed}
+.navicon{position:absolute;top:607px}
+.navlabel{position:absolute;top:629.8px;width:60px;margin-left:-30px;text-align:center;font:500 8.6px/1 Roboto,Arial,sans-serif;color:#262626;letter-spacing:-.05px}
+.navlabel.active{color:#2f6fbf}
+.home{left:100px;top:653px;width:98px;height:4px;border-radius:2px;background:#111}
+/* Mockup 4: geöffnete E-Mail */
+.om-band{position:absolute;left:0;top:91px;width:297.5px;height:54px;background:#f3f3f3}
+.om-pill{position:absolute;left:14px;top:111.5px;height:20.5px;padding:0 11px;border-radius:10.5px;background:#fff;border:1px solid #e4e4e4;box-shadow:0 0 5px rgba(0,0,0,.04);font:500 10.8px/18.5px Roboto,Arial,sans-serif;color:#2B60A8;white-space:nowrap}
+.om-unsub{position:absolute;right:36px;top:114.5px;font:400 11.6px/14px Roboto,Arial,sans-serif;color:#1A66C4;white-space:nowrap}
+.om-unsub-ic{position:absolute;right:10px;top:110.5px;width:18px;height:18px}
+.om-pager{position:absolute;left:216px;top:45px;width:74px;height:35px;border-radius:17.5px;background:#fff;box-shadow:0 0 10px rgba(0,0,0,.065)}
+.om-pager svg{position:absolute;top:12px}
+.om-name{position:absolute;left:59.5px;top:163.5px;height:14px;max-width:198px;display:flex;align-items:center;white-space:nowrap}
+.om-name .sender{color:#2B60A8}
+.om-date{position:absolute;left:59.5px;top:183px;font:400 12.3px/12.3px Roboto,Arial,sans-serif;color:#858585;white-space:nowrap}
+.om-one{position:absolute;right:23px;top:163.5px;font:400 12.3px/12.3px Roboto,Arial,sans-serif;color:#959595}
+.om-chev{position:absolute;right:10px;top:163px;width:8px;height:13px}
+.om-star{position:absolute;right:9px;top:203px;width:15px;height:15px}
+.om-line{position:absolute;left:14.5px;top:212px;width:243px;height:1px;background:#e4e4e4}
+.om-subject{position:absolute;left:14.5px;top:233px;width:270px;font:700 16.2px/19.6px Roboto,Arial,sans-serif;color:#1f1f1f;word-wrap:break-word;overflow-wrap:anywhere}
+.om-dock{position:absolute;left:0;top:581px;width:297.5px;height:77px;background:linear-gradient(to bottom,rgba(255,255,255,0) 0,#f8f8f8 17px,#f4f4f4 100%)}
+.om-bar{position:absolute;left:12px;top:601px;width:223px;height:42px;border-radius:21px;background:#fff;box-shadow:0 1px 8px rgba(0,0,0,.08)}
+.om-compose{position:absolute;left:245px;top:602px;width:40px;height:40px;border-radius:20px;background:#fff;box-shadow:0 1px 8px rgba(0,0,0,.08);display:flex;align-items:center;justify-content:center}
+.om-ic{position:absolute;top:612px}
+.om-ic svg,.om-unsub-ic,.om-chev,.om-star,.om-pager svg{display:block}
+.downloadbtn{border:1px solid #777;background:#fff;color:#111;border-radius:6px;padding:9px 14px;font:600 13px Arial,sans-serif;cursor:pointer}
+.downloadbtn:hover{background:#f4f4f4}
+.downloadbtn.primary{background:#1667c7;border-color:#1667c7;color:#fff}
+.downloadbtn.primary:hover{background:#1a73dc}
+.downloadbtn:disabled{opacity:.6;cursor:wait}
+</style>'''
+
+PHONE_OPEN = r'''<div class="phonewrap">
+<div class="sidebtn" style="left:4px;top:129px;width:5px;height:22px"></div>
+<div class="sidebtn" style="left:4px;top:174px;width:5px;height:44px"></div>
+<div class="sidebtn" style="left:4px;top:235px;width:5px;height:44px"></div>
+<div class="sidebtn" style="left:331.5px;top:208px;width:6px;height:71px"></div>
+<div class="phone"><div class="l1"></div><div class="l2"></div><div class="l3"></div><div class="bezel"></div>
+<div class="screen">'''
+
+PHONE_HEAD = r'''<span class="abs time nowtime">09:24</span>
+<span class="abs island"><i></i></span>
+<span class="abs signal"><svg width="18" height="11" viewBox="0 0 18 11" aria-label="Mobilfunk"><rect x="1.2" y="6.2" width="2.7" height="4.5" rx=".7" fill="#111"/><rect x="5.8" y="4.7" width="2.7" height="6" rx=".7" fill="#c6c6c6"/><rect x="10.4" y="2.9" width="2.7" height="7.8" rx=".7" fill="#c6c6c6"/><rect x="15" y="1" width="2.7" height="9.7" rx=".7" fill="#c6c6c6"/></svg></span>
+<span class="abs wifi"><svg width="13" height="9.5" viewBox="0 0 13 9.5" aria-label="WLAN"><path d="M1 3.6a7.9 7.9 0 0 1 11 0" fill="none" stroke="#c9c9c9" stroke-width="1.7" stroke-linecap="round"/><path d="M3.1 5.7a4.9 4.9 0 0 1 6.8 0" fill="none" stroke="#000" stroke-width="1.7" stroke-linecap="round"/><path d="M6.5 9.1 4.9 7.5a2.3 2.3 0 0 1 3.2 0z" fill="#000" stroke="#000" stroke-width=".9" stroke-linejoin="round"/></svg></span>
+<span class="abs battery">93</span><span class="abs battip"></span>
+<span class="abs round" style="left:3px"><svg class="hicon" width="16" height="16" viewBox="0 0 16 16"><path d="M11 1.6 4.6 8l6.4 6.4"/></svg></span>
+<span class="t title">Posteingang</span><span class="t mail">trusteddialog99@gmx.net</span>
+<span class="abs round" style="left:210.5px"><svg class="hicon" width="18" height="18" viewBox="0 0 18 18" style="stroke-width:1.7"><circle cx="9" cy="9" r="7.4"/><path d="m5.9 9.2 2.1 2.1 4.1-4.4"/></svg></span>
+<span class="abs round" style="left:255px"><svg width="19" height="19" viewBox="0 0 19 19"><path d="M8.5 3.2H4.2A1.7 1.7 0 0 0 2.5 4.9v9.9a1.7 1.7 0 0 0 1.7 1.7h9.9a1.7 1.7 0 0 0 1.7-1.7v-4.3" fill="none" stroke="#111" stroke-width="2" stroke-linecap="round"/><path d="M14.6 1.7a1.6 1.6 0 0 1 2.3 2.3l-7.2 7.2-3.2.9.9-3.2z" fill="#111"/></svg></span>
+<div class="abs search"><span class="sicon"><svg width="12" height="12" viewBox="0 0 12 12"><circle cx="5" cy="5" r="4" fill="none" stroke="#111" stroke-width="1.6"/><path d="m8 8 3.2 3.2" stroke="#111" stroke-width="1.7" stroke-linecap="round"/></svg></span><span class="t">Suchen</span></div>
+<span class="abs sline"></span>'''
+
+PHONE_FOOT = r'''<div class="abs dock"></div>
+<div class="abs nav"></div><div class="abs navhl"></div>
+<span class="navicon" style="left:31px;top:609px"><svg width="18" height="15" viewBox="0 0 18 15"><rect width="18" height="15" fill="#1667c7"/><path d="M.6 .9 9 8l8.4-7.1M.6 14.2l6.3-6.6M17.4 14.2l-6.3-6.6" fill="none" stroke="#fff" stroke-width="1.15"/></svg></span>
+<span class="navicon" style="left:86px;top:610px"><svg width="16.5" height="13.5" viewBox="0 0 18 13.5" preserveAspectRatio="none"><path d="M0 1.3C0 .6.5 0 1.2 0h4.7l1.7 1.9h9.2c.7 0 1.2.6 1.2 1.3v9c0 .7-.5 1.3-1.2 1.3H1.2C.5 13.5 0 12.9 0 12.2z" fill="#111"/></svg></span>
+<span class="navicon" style="left:135px;top:608px"><svg width="21" height="19" viewBox="0 0 21 19"><path d="M1.2 5.2v11.6c0 .6.5 1.1 1.1 1.1h11.8" fill="none" stroke="#111" stroke-width="1.8" stroke-linecap="round"/><rect x="4.6" y=".3" width="15.6" height="14.4" rx="1.3" fill="#111"/><path d="m7.3 11.6 3.1-3.6 2 2.2 1.8-2 3 3.4z" fill="#fff"/><circle cx="16" cy="4.5" r="1.3" fill="#fff"/></svg></span>
+<span class="navicon" style="left:193px;top:612px"><svg width="15" height="11" viewBox="0 0 15 11"><rect x="0" y="7.2" width="2.4" height="3.8" rx=".5" fill="#222"/><rect x="4.2" y="4.8" width="2.4" height="6.2" rx=".5" fill="#222"/><rect x="8.4" y="2.4" width="2.4" height="8.6" rx=".5" fill="#222"/><rect x="12.6" y="0" width="2.4" height="11" rx=".5" fill="#222"/></svg></span>
+<span class="navicon" style="left:243px;top:608px"><svg width="19" height="17" viewBox="0 0 19 17"><rect x="0" y="0" width="19" height="17" rx="1.2" fill="#111"/><path d="M3 2.6v12" stroke="#fff" stroke-width="1"/><rect x="5.3" y="2.7" width="11" height="2.8" fill="none" stroke="#fff" stroke-width=".95"/><path d="M5.3 8.2h4.4M5.3 11.4h4.4" stroke="#fff" stroke-width="1.1"/><rect x="11.4" y="7.4" width="4.9" height="4.8" fill="none" stroke="#fff" stroke-width=".95"/></svg></span>
+<span class="navlabel active" style="left:40.5px">E-Mail</span>
+<span class="navlabel" style="left:93.5px">Dateien</span>
+<span class="navlabel" style="left:146.5px">Fotos</span>
+<span class="navlabel" style="left:200.5px">Mobile</span>
+<span class="navlabel" style="left:252.5px">News</span>
+<div class="abs home"></div>'''
+
+PHONE_CLOSE = '</div></div></div>'
+
+# --- Mockup 4 (geöffnete E-Mail): nutzt Status-Leiste, Zurück-Button, Titel-/Mail-Zeile des Posteingangs unverändert weiter ---
+_BACK_AT = PHONE_HEAD.index('<span class="abs round" style="left:3px">')
+_TITLE_AT = PHONE_HEAD.index('<span class="t title">')
+_RIGHT_AT = PHONE_HEAD.index('<span class="abs round" style="left:210.5px">')
+OM_STATUS = PHONE_HEAD[:_BACK_AT]                    # Uhrzeit (live), Dynamic Island, Netz, WLAN, Batterie
+OM_BACK = PHONE_HEAD[_BACK_AT:_TITLE_AT]             # runder Zurück-Button
+OM_MAILADDR = r'''<span class="t mail">trusteddialog99@gmx.net</span>'''
+OM_UNSUB_ICON = (r'''<svg class="om-unsub-ic" viewBox="0 0 17 17" fill="none" stroke="#1A66C4" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">'''
+                 r'''<path d="M2.4 5.2V3.6h8.2"/><path d="M14.4 7.2v7.4h-3.2"/><circle cx="5.9" cy="11.2" r="3.7" stroke-width="2"/><path d="M4.2 11.2h3.4" stroke-width="1.9"/>'''
+                 r'''<path d="m11.3 1.3 3.4 3.4m0-3.4-3.4 3.4" stroke-width="2"/></svg>''')
+OM_PAGER = (r'''<span class="om-pager"><svg style="left:19px" width="17" height="10" viewBox="0 0 17 10" fill="none" stroke="#111" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M1.5 8.5 8.5 1.5l7 7"/></svg>'''
+            r'''<svg style="left:46px" width="17" height="10" viewBox="0 0 17 10" fill="none" stroke="#111" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M1.5 1.5l7 7 7-7"/></svg></span>''')
+OM_CHEVRON = r'''<svg class="om-chev" viewBox="0 0 8 13" fill="none" stroke="#b3b3b3" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M1.5 1.5 6.3 6.5 1.5 11.5"/></svg>'''
+OM_STAR = r'''<svg class="om-star" viewBox="0 0 15 15" fill="none" stroke="#b2b2b2" stroke-width="1.3" stroke-linejoin="round"><path d="M7.5 1.4l1.8 3.9 4.2.5-3.1 2.9.8 4.2-3.7-2.1-3.7 2.1.8-4.2L1.5 5.8l4.2-.5z"/></svg>'''
+# Symbolleiste: Verschieben, Löschen, Antworten, Erinnerung (blau), Mehr | runder Schreiben-Button
+OM_TOOLBAR = (r'''<div class="om-dock"></div><div class="om-bar"></div>'''
+  r'''<span class="om-ic" style="left:23px;top:614px"><svg width="19" height="16" viewBox="0 0 19 16" fill="none" stroke="#111" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12.5 1.5h3.6a1.6 1.6 0 0 1 1.6 1.6v9.8a1.6 1.6 0 0 1-1.6 1.6H5.2"/><path d="M1.5 8h9.6M7.9 4.6 11.3 8l-3.4 3.4"/><path d="M5.2 14.5H4"/></svg></span>'''
+  r'''<span class="om-ic" style="left:69px;top:612px"><svg width="18" height="19" viewBox="0 0 18 19" fill="none" stroke="#111" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M2 4.6h14M6.6 4.6V2.6c0-.6.4-1 1-1h2.8c.6 0 1 .4 1 1v2M3.6 4.6l.7 11.1c.1.9.7 1.5 1.6 1.5h6.2c.9 0 1.5-.6 1.6-1.5l.7-11.1M7.2 8v5.8M10.8 8v5.8"/></svg></span>'''
+  r'''<span class="om-ic" style="left:113px;top:613px"><svg width="20" height="17" viewBox="0 0 20 17" fill="none" stroke="#111" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M8.2 1.8 2 7.4l6.2 5.6V9.6c4.6-.4 7.8.9 9.8 4.6-.4-5.4-3.7-8.7-9.8-8.9z"/></svg></span>'''
+  r'''<span class="om-ic" style="left:158.5px;top:612px"><svg width="19" height="19" viewBox="0 0 19 19" fill="none" stroke="#5B57BE" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="9.5" cy="10.4" r="6.6"/><path d="M9.5 6.9v3.8l2.4 1.5M2.2 4.2 5 1.8M16.8 4.2 14 1.8"/></svg></span>'''
+  r'''<span class="om-ic" style="left:203.5px;top:620px"><svg width="17" height="4" viewBox="0 0 17 4"><circle cx="2" cy="2" r="1.7" fill="#111"/><circle cx="8.5" cy="2" r="1.7" fill="#111"/><circle cx="15" cy="2" r="1.7" fill="#111"/></svg></span>'''
+  r'''<span class="om-compose"><svg width="19" height="19" viewBox="0 0 19 19"><path d="M8.5 3.2H4.2A1.7 1.7 0 0 0 2.5 4.9v9.9a1.7 1.7 0 0 0 1.7 1.7h9.9a1.7 1.7 0 0 0 1.7-1.7v-4.3" fill="none" stroke="#111" stroke-width="2" stroke-linecap="round"/><path d="M14.6 1.7a1.6 1.6 0 0 1 2.3 2.3l-7.2 7.2-3.2.9.9-3.2z" fill="#111"/></svg></span>'''
+  r'''<div class="abs home"></div>''')
+
+TD_ROW = r'''<div class="row" style="top:134px;height:__H__px">__AV__<div class="nl" style="top:9.2px"><span class="sender fit">__SENDER__</span>__SEAL__</div><div class="tm" style="top:10.7px" data-off="-3"></div><div class="sj unread fit" style="top:27.6px">__SUBJECT__</div><div class="pr fit" style="top:44.6px">__PRE__</div>__PVBLOCK____PROMO__<div class="div"></div></div>'''
+
+OTHER_ROWS = r'''<div class="row" style="top:__T1__px;height:58.5px"><span class="avatar" style="top:10px">OH</span><div class="nl" style="top:15.2px"><span class="sender">Otto Holler</span></div><div class="tm" style="top:14.7px" data-off="-23"></div><div class="sj" style="top:33.6px">Gewünschte Bilder</div><div class="div"></div></div>
+<div class="row" style="top:__T2__px;height:58.5px"><span class="avatar" style="top:10px">FF</span><div class="nl" style="top:15.2px"><span class="sender">Fred Fritt</span></div><div class="tm" style="top:14.7px" data-off="-69"></div><div class="sj" style="top:33.6px">Klassentreffen</div><div class="div"></div></div>
+<div class="row" style="top:__T3__px;height:72.5px"><img class="avatar" style="top:9.5px;background:#1d72e8" src="__GMXLOGO__" alt="GMX"><div class="nl" style="top:13.7px"><span class="sender">GMX Magazin</span>__SEAL__</div><div class="tm" style="top:15.2px" data-off="-117"></div><div class="sj fit" style="top:31.1px">Traumhaus auf Föhr zu gewinnen: 8 Zimmer, Meerblick</div><div class="pr fit" style="top:49.1px">Jetzt Lose bei GMX Lotto sichern! Wer jetzt mitspielt …</div><div class="div"></div></div>
+<div class="row" style="top:__T4__px;height:72px"><span class="avatar" style="top:8px">SW</span><div class="nl" style="top:13.2px"><span class="sender">Shopping World</span></div><div class="tm" style="top:14.7px" data-off="-145"></div><div class="sj" style="top:30.6px">Neue Deals am Wochenende</div><div class="pr" style="top:47.6px">Jetzt entdecken</div><div class="div"></div></div>'''
+
+BOARD_TEMPLATE = r'''<!doctype html><html><head><meta charset="utf-8">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700&family=Inter:wght@600;700&display=swap">
+<script src="https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js"></script>__CSS__</head><body><div class="wrap">
+<div id="fitbox"><div id="scaler"><div id="board">
+<div class="col" id="col1"><div class="ptitle">Ohne trustedDialog</div>__PHONE1__</div>
+<div class="col" id="col2"><div class="ptitle">Mit trustedDialog</div>__PHONE2__</div>
+<div class="col" id="col3"><div class="ptitle">Mit trustedDialog Preview</div>__PHONE3__</div>__COL4__
+</div></div></div>
+<div class="toolbar" id="toolbar"><button class="downloadbtn primary" onclick="downloadBoard(this)">Alle __N__ Mockups als eine PNG-Grafik herunterladen</button><button class="downloadbtn" onclick="downloadPhone(this)">Nur Mockup 3 (mit Preview)</button>__BTN4__</div>
+</div>
+<script>
+const BOARD_W=__BW__,BOARD_H=__BH__;
+const p=n=>String(n).padStart(2,'0'),fmt=d=>p(d.getHours())+':'+p(d.getMinutes());
+function tick(){let n=new Date();document.querySelectorAll('.nowtime').forEach(x=>x.textContent=fmt(n));document.querySelectorAll('[data-off]').forEach(x=>x.textContent=fmt(new Date(n.getTime()+Number(x.dataset.off)*60000)))}
+tick();setInterval(tick,30000);
+/* Zu lange Texte pixelgenau mit „…“ kürzen (wie in der GMX-App). Beim Absender bleibt das Siegel dadurch immer sichtbar. */
+function fitText(el){
+ if(el.dataset.full===undefined) el.dataset.full=el.textContent;
+ const full=el.dataset.full; el.textContent=full;
+ const fits=()=>el.scrollWidth<=el.clientWidth+.5;
+ if(fits()) return;
+ let lo=0,hi=full.length;
+ while(lo<hi){const mid=(lo+hi+1)>>1;el.textContent=full.slice(0,mid).trimEnd()+'…';if(fits()) lo=mid; else hi=mid-1;}
+ el.textContent=full.slice(0,lo).trimEnd()+'…';
+}
+function fitAll(){document.querySelectorAll('.fit').forEach(fitText)}
+fitAll();
+if(document.fonts&&document.fonts.ready) document.fonts.ready.then(fitAll);
+/* Avatar der tD-Mails (Gerät 2 und 3): SVG/PNG auf den gewählten Hintergrund (Standard Weiß) legen und als PNG fixieren. */
+/* Kontrastregel: Logo auf Weiß; ist es hell/weiß (auf Weiß nicht lesbar), automatisch auf Dunkelgrau. */
+function relLum(r,g,b){const c=v=>{v/=255;return v<=.03928?v/12.92:Math.pow((v+.055)/1.055,2.4)};return .2126*c(r)+.7152*c(g)+.0722*c(b);}
+function contrastRatio(l1,l2){return (Math.max(l1,l2)+.05)/(Math.min(l1,l2)+.05);}
+function readableBackground(source,fallback){
+ try{
+  const n=64,probe=document.createElement('canvas');probe.width=n;probe.height=n;
+  const pc=probe.getContext('2d');pc.drawImage(source,0,0,n,n);
+  const d=pc.getImageData(0,0,n,n).data;let vis=0,onWhite=0,onDark=0;
+  const lw=1,ld=relLum(31,31,31);
+  for(let i=0;i<d.length;i+=4){if(d[i+3]<=160)continue;vis++;const l=relLum(d[i],d[i+1],d[i+2]);
+   if(contrastRatio(l,lw)>=2.5)onWhite++;if(contrastRatio(l,ld)>=2.5)onDark++;}
+  if(!vis||vis/(n*n)>.92) return '#FFFFFF';             /* deckendes Icon mit eigenem Hintergrund */
+  return (onWhite/vis>=.3||onWhite>=onDark)?'#FFFFFF':'#1F1F1F';
+ }catch(err){return fallback;}
+}
+async function rasterizeTdAvatar(img){
+ const source=new Image();
+ await new Promise((resolve,reject)=>{source.onload=resolve;source.onerror=reject;source.src=img.dataset.src;});
+ const size=264,canvas=document.createElement('canvas');canvas.width=size;canvas.height=size;
+ const ctx=canvas.getContext('2d');
+ const bg=readableBackground(source,img.dataset.bg||'#ffffff');img.style.background=bg;
+ ctx.fillStyle=bg;ctx.fillRect(0,0,size,size);
+ const pad=size*Math.max(0,Math.min(.4,Number(img.dataset.pad)||0)),inner=size-2*pad;
+ const sw=source.naturalWidth||size,sh=source.naturalHeight||size;
+ const scale=img.dataset.fit==='cover'?Math.max(inner/sw,inner/sh):Math.min(inner/sw,inner/sh);
+ const dw=sw*scale,dh=sh*scale;
+ ctx.imageSmoothingQuality='high';
+ ctx.drawImage(source,(size-dw)/2,(size-dh)/2,dw,dh);
+ img.style.padding='0';img.style.objectFit='cover';
+ img.src=canvas.toDataURL('image/png');
+}
+(async()=>{for(const img of document.querySelectorAll('img.td-avatar')){try{await rasterizeTdAvatar(img);}catch(err){console.warn('Avatar konnte nicht in PNG umgewandelt werden',err);}}})();
+/* Die drei Geräte werden immer komplett in den sichtbaren Bereich eingepasst (nur die Anzeige wird skaliert, nie der Export). */
+function fitBoard(){
+ const box=document.getElementById('fitbox'),scaler=document.getElementById('scaler'),bar=document.getElementById('toolbar');
+ const availW=document.documentElement.clientWidth,availH=window.innerHeight-bar.offsetHeight-6;
+ const s=Math.max(.2,Math.min(1,availW/BOARD_W,availH/BOARD_H));
+ scaler.style.transform='scale('+s+')';
+ box.style.width=Math.round(BOARD_W*s)+'px';box.style.height=Math.round(BOARD_H*s)+'px';
+}
+fitBoard();window.addEventListener('resize',fitBoard);
+function safeSender(){return String(__DLSENDER__).trim().replace(/[\\/:*?"<>|]+/g,'_')||'Absender';}
+async function exportNode(node,w,h,filename,button,bg){
+ const original=button.textContent;
+ try{
+  button.disabled=true;button.textContent='PNG wird erstellt…';
+  if(typeof html2canvas==='undefined') throw new Error('html2canvas konnte nicht geladen werden');
+  await document.fonts.ready;fitAll();
+  await Promise.all(Array.from(node.querySelectorAll('img')).map(img=>img.complete ? Promise.resolve() : new Promise(resolve=>{img.onload=resolve;img.onerror=resolve;})));
+  const canvas=await html2canvas(node,{
+   backgroundColor:bg,
+   scale:3,
+   useCORS:true,
+   allowTaint:false,
+   logging:false,
+   width:w,
+   height:h,
+   windowWidth:BOARD_W,
+   windowHeight:BOARD_H,
+   scrollX:0,
+   scrollY:0,
+   onclone:(doc)=>{
+    /* Export immer in voller Größe, unabhängig von der Skalierung der Anzeige */
+    const box=doc.getElementById('fitbox'),scaler=doc.getElementById('scaler');
+    scaler.style.transform='none';
+    box.style.width=BOARD_W+'px';box.style.height=BOARD_H+'px';box.style.overflow='visible';box.style.boxShadow='none';box.style.borderRadius='0';
+    doc.querySelectorAll('img.preview').forEach(img=>{
+     const wrap=img.closest('.pwrap');
+     if(wrap){
+      wrap.style.backgroundImage='url("'+img.src+'")';
+      wrap.style.backgroundSize='cover';
+      wrap.style.backgroundPosition='center center';
+      wrap.style.backgroundRepeat='no-repeat';
+      img.style.visibility='hidden';
+     }
+    });
+    doc.querySelectorAll('img.avatar').forEach(img=>{
+     img.style.width='33px';img.style.height='33px';
+     img.style.minWidth='33px';img.style.minHeight='33px';
+     img.style.maxWidth='33px';img.style.maxHeight='33px';
+     img.style.borderRadius='50%';img.style.objectFit='cover';
+     img.style.objectPosition='center center';img.style.display='block';img.style.visibility='visible';
+    });
+   }
+  });
+  const blob=await new Promise(resolve=>canvas.toBlob(resolve,'image/png'));
+  if(!blob) throw new Error('PNG-Blob konnte nicht erzeugt werden');
+  const url=URL.createObjectURL(blob);
+  const link=document.createElement('a');
+  link.download=filename;
+  link.href=url;
+  document.body.appendChild(link);link.click();link.remove();
+  setTimeout(()=>URL.revokeObjectURL(url),1000);
+ }catch(err){
+  console.error(err);
+  alert('Die PNG-Datei konnte nicht erzeugt werden: '+err.message);
+ }finally{button.disabled=false;button.textContent=original;}
+}
+function downloadBoard(button){return exportNode(document.getElementById('board'),BOARD_W,BOARD_H,'GMX_trustedDialog_Vergleich_'+safeSender()+'.png',button,'#ffffff');}
+function downloadPhone(button){return exportNode(document.querySelector('#col3 .phonewrap'),344,701,'GMX_trustedDialogPreview_'+safeSender()+'.png',button,null);}
+function downloadPhone4(button){return exportNode(document.querySelector('#col4 .phonewrap'),344,701,'GMX_geoeffnete_Mail_'+safeSender()+'.png',button,null);}
+</script></body></html>'''
+
+
+def phone_html(avatar, show_seal, show_preview, sender, subject, preheader, preview_block, promo_block=''):
+    """Ein Gerät. Header und Footer sind in allen drei Varianten identisch; nur die erste Mail unterscheidet sich.
+    promo_block (nur mit Preview): Promo-Code-Box unter der Grafik; die folgenden Mails rücken um PROMO_EXTRA nach unten."""
+    seal = f'<img class="seal" src="{SEAL}" alt="trustedDialog Siegel">' if show_seal else ''
+    promo_block = promo_block if show_preview else ''
+    row_h = (TD_ROW_H_PREVIEW + (PROMO_EXTRA if promo_block else 0)) if show_preview else TD_ROW_H_PLAIN
+    shift = (-PROMO_EXTRA if promo_block else 0) if show_preview else ROW_SHIFT
+    first = (TD_ROW.replace('__H__', f'{row_h:g}').replace('__AV__', avatar).replace('__SEAL__', seal)
+             .replace('__SENDER__', sender).replace('__SUBJECT__', subject).replace('__PRE__', preheader)
+             .replace('__PVBLOCK__', preview_block if show_preview else '').replace('__PROMO__', promo_block))
+    rest = OTHER_ROWS.replace('__GMXLOGO__', GMX_LOGO).replace('__SEAL__', f'<img class="seal" src="{SEAL}" alt="trustedDialog Siegel">')
+    for token, top in (('__T1__', 303), ('__T2__', 361.5), ('__T3__', 420), ('__T4__', 492.5)):   # Fred Fritt ohne Preview-Text (58,5 px)
+        rest = rest.replace(token, f'{top - shift:g}')
+    return PHONE_OPEN + PHONE_HEAD + first + rest + PHONE_FOOT + PHONE_CLOSE
+
+
+MAIL_COUNT = OTHER_ROWS.count('class="row"') + 1      # Mails in der Maillist der Mockups 1-3 (tD-Mail + 4 weitere) = 5
+
+
+def open_mail_html(avatar, sender, subject, position=1, total=MAIL_COUNT):
+    """Mockup 4: geöffnete E-Mail (Dummy). Header, Absenderzeile und Betreff sind gefüllt, der Mail-Inhalt bleibt frei.
+    Avatar = Avatar der tD-Mails (Gerät 2/3); Absender = Marke, das Siegel folgt der Textlänge; Zeit = Zeit der ersten Mail der Maillist."""
+    avatar = avatar.replace('top:6px', 'top:160px', 1)       # Avatar sitzt hier in der Absenderzeile unter dem Newsletter-Header
+    seal = f'<img class="seal" src="{SEAL}" alt="trustedDialog Siegel">'
+    head = (OM_STATUS + '<span class="om-band"></span>' + OM_BACK
+            + f'<span class="t title">{position} von {total}</span>' + OM_MAILADDR + OM_PAGER
+            + '<span class="om-pill">Newsletter</span><span class="om-unsub">Newsletter abbestellen</span>' + OM_UNSUB_ICON)
+    body = (avatar
+            + f'<div class="om-name"><span class="sender fit">{sender}</span>{seal}</div>'
+            + '<div class="om-date">Heute um <span data-off="-3"></span></div>'      # -3 = gleiche Zeit wie die erste Mail der Maillist
+            + '<span class="om-one">1</span>' + OM_CHEVRON + OM_STAR + '<div class="om-line"></div>'
+            + f'<div class="om-subject">{subject}</div>')
+    return PHONE_OPEN + head + body + OM_TOOLBAR + PHONE_CLOSE
+
+
+def promo_html(label, code):
+    """Promo-Code-Box: „Beschreibung:“ fett/schwarz, Code blau, gepunktete grüne Umrandung (#45872F)."""
+    label = re.sub(r'\s+', ' ', label or '').strip().rstrip(':').strip()[:PROMO_LABEL_MAX]
+    code = re.sub(r'\s+', ' ', code or '').strip()[:PROMO_CODE_MAX]
+    if not (label or code):
+        return ''
+    # Box ist max. 216 px breit (innen ca. 193 px): bei langen Texten Schrift verkleinern, damit nichts übersteht
+    est = (len(label) + 1 + len(code)) * 5.9 + 2.7
+    size = max(7.0, min(10.6, 10.6 * 193 / est)) if est > 193 else 10.6
+    style = f' style="font-size:{size:.1f}px"' if size < 10.6 else ''
+    return f'<div class="promo"{style}>{f"<b>{e(label)}:</b>" if label else ""}<span>{e(code)}</span></div>'
+
+
+def build_board_html(sender_name, subject_text, preheader_text, avatar_src='', avatar_bg=AVATAR_BG_DEFAULT,
+                     avatar_fit='contain', avatar_pad=0.0, fallback_color=AVATAR_DEFAULT, preview_src='',
+                     promo_label='', promo_code='', show_promo=False, show_open_mail=False):
+    """Erzeugt die Gegenüberstellung der drei GMX-Smartphone-Mockups (HTML) für die Live-Vorschau und den PNG-Export.
+    Alle drei Geräte erhalten dieselben Texte (Absender/Marke, Betreff, Preview-Text)."""
+    bg = e(avatar_bg or AVATAR_BG_DEFAULT)
+    letters = e(''.join(x[0] for x in (sender_name or '').split()[:2]).upper() or 'M')
+    initials = (f'<span class="avatar" style="top:6px;background:{e(fallback_color)};color:{initials_text_color(fallback_color)}">'
+                f'{letters}</span>')
+    if avatar_src:
+        fit = 'cover' if avatar_fit == 'cover' else 'contain'
+        pad_px = round(33 * avatar_pad, 2)
+        logo = (f'<img class="avatar td-avatar" style="top:6px;background:{bg};object-fit:{fit};padding:{pad_px}px" '
+                f'src="{avatar_src}" data-src="{avatar_src}" data-bg="{bg}" data-fit="{fit}" data-pad="{avatar_pad}" alt="">')
+    else:
+        logo = initials
+    pv = f'<img class="preview" src="{preview_src}">' if preview_src else '<div class="preview placeholder">Bild einfügen</div>'
+    preview_block = f'<div class="pwrap">{pv}</div>'
+    texts = (display_text(sender_name) or 'Marke', display_text(subject_text), display_text(preheader_text))
+    download_sender = json.dumps(sender_name or 'Absender', ensure_ascii=False).replace('<', '\\u003c')
+    phones = (
+        phone_html(initials, False, False, *texts, preview_block),   # 1. ohne trustedDialog: Initialen-Avatar, kein Siegel
+        phone_html(logo, True, False, *texts, preview_block),        # 2. mit trustedDialog: Logo-Avatar + Siegel
+        phone_html(logo, True, True, *texts, preview_block,          # 3. mit trustedDialog Preview: zusätzlich Preview-Grafik
+                   promo_html(promo_label, promo_code) if show_promo else ''),   # ggf. mit Promo-Code
+    )
+    board_w = BOARD_W_4 if show_open_mail else BOARD_W
+    col4 = btn4 = ''
+    if show_open_mail:     # optionales 4. Mockup: geöffnete E-Mail
+        col4 = ('<div class="col" id="col4"><div class="ptitle">Geöffnete E-Mail</div>'
+                + open_mail_html(logo, texts[0], texts[1]) + '</div>')
+        btn4 = '<button class="downloadbtn" onclick="downloadPhone4(this)">Nur Mockup 4 (geöffnete Mail)</button>'
+    # Kontrastregel auch für die Beispiel-Mails (OH, FF, SW): Initialen auf #B8DDFD in gut lesbarer Schrift
+    out = BOARD_TEMPLATE.replace('__CSS__', PHONE_CSS.replace(
+        'justify-content:center;color:#fff;font:700 12.5px/33px', f'justify-content:center;color:{initials_text_color(AVATAR_DEFAULT)};font:700 12.5px/33px'))
+    for token, value in {'__COL4__': col4, '__BTN4__': btn4, '__N__': '4' if show_open_mail else '3',
+                         '__PHONE1__': phones[0], '__PHONE2__': phones[1], '__PHONE3__': phones[2],
+                         '__BW__': str(board_w), '__BH__': str(BOARD_H), '__DLSENDER__': download_sender}.items():
+        out = out.replace(token, value)
+    return out
+
+
+avatar_src, avatar_bg = '', AVATAR_BG_DEFAULT
+if af:
+    uploaded = avatar_info(af.getvalue())
+    avatar_src, avatar_bg = (uploaded['src'], uploaded['bg']) if uploaded else (uri(af), AVATAR_BG_DEFAULT)
+elif st.session_state.avatar_options and 0 <= st.session_state.avatar_choice < len(st.session_state.avatar_options):
+    chosen_avatar = st.session_state.avatar_options[st.session_state.avatar_choice]
+    avatar_src, avatar_bg = chosen_avatar['src'], chosen_avatar.get('bg', AVATAR_BG_DEFAULT)
+psrc = uri(pf) if pf else ('data:image/png;base64,' + base64.b64encode(st.session_state.generated_preview).decode()
+                           if st.session_state.generated_preview else '')
+H = build_board_html(st.session_state.sender, st.session_state.subject, st.session_state.preheader, avatar_src,
+                     avatar_bg, 'cover' if st.session_state.avatar_fit == 'Füllend' else 'contain',
+                     st.session_state.avatar_pad / 100, AVATAR_DEFAULT, psrc,
+                     st.session_state.promo_label, st.session_state.promo_code, bool(st.session_state.promo_show),
+                     bool(st.session_state.show_open_mail))
+with right:
+    # Rechte Spalte bleibt beim Scrollen der Eingabefelder stehen (sticky) und ist so hoch wie der sichtbare Bereich.
+    # Die Anzeige skaliert die drei Geräte automatisch in diese Fläche; der PNG-Export bleibt immer in voller Größe.
+    st.markdown(STICKY_CSS, unsafe_allow_html=True)
+    html_component = getattr(components, 'html', None)   # in neueren Streamlit-Versionen abgekündigt
+    if html_component is not None:
+        html_component(H, height=800, scrolling=False)
+    else:
+        st.iframe(H, height=800)
+st.caption('Echtes trustedDialog SVG-Siegel · Avatar-Auswahl aus der Website · Live-Zeit mit früheren Mailzeiten · '
+           'Maße nach GMX-App-Vorlage (je Gerät 344 × 701 px) · Export: eine Grafik mit allen 3 bzw. 4 Mockups')
